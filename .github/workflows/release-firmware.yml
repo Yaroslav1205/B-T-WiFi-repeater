@@ -33,7 +33,10 @@ jobs:
           ref: ${{ env.RELEASE_REF }}
 
       - name: Build firmware
-        run: idf.py build
+        shell: bash
+        run: |
+          . "${IDF_PATH}/export.sh"
+          idf.py build
 
       - name: Read firmware version
         run: |
