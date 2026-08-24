@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -17,6 +18,7 @@
 #define FIRMWARE_MANIFEST_BUFFER_SIZE 1024
 #define FIRMWARE_URL_MAX_LEN 256
 #define FIRMWARE_HTTP_READ_BUFFER_SIZE 1024
+#define FIRMWARE_HTTP_MAX_REDIRECTS 5
 #define FIRMWARE_UPDATE_TASK_STACK_SIZE 8192
 
 static const char *TAG = "RepeaterFirmware";
@@ -108,6 +110,19 @@ static void repeater_firmware_reset_current_version_locked(void)
                                 sizeof(s_status.current_version));
 }
 
+static esp_http_client_config_t repeater_firmware_make_http_config(const char *url)
+{
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = PROJECT_FIRMWARE_HTTP_TIMEOUT_MS,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .max_redirection_count = FIRMWARE_HTTP_MAX_REDIRECTS,
+    };
+
+    return config;
+}
+
 static int repeater_firmware_read_version_segment(const char **cursor)
 {
     int value = 0;
@@ -157,11 +172,7 @@ static int repeater_firmware_compare_versions(const char *left, const char *righ
 
 static esp_err_t repeater_firmware_http_get_text(const char *url, char *buffer, size_t buffer_size)
 {
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = PROJECT_FIRMWARE_HTTP_TIMEOUT_MS,
-    };
+    esp_http_client_config_t config = repeater_firmware_make_http_config(url);
     esp_http_client_handle_t client = NULL;
     esp_err_t err;
     int total_read = 0;
@@ -348,11 +359,7 @@ static esp_err_t repeater_firmware_check_manifest(repeater_firmware_manifest_t *
 
 static esp_err_t repeater_firmware_download_and_apply(const char *firmware_url)
 {
-    esp_http_client_config_t config = {
-        .url = firmware_url,
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = PROJECT_FIRMWARE_HTTP_TIMEOUT_MS,
-    };
+    esp_http_client_config_t config = repeater_firmware_make_http_config(firmware_url);
     esp_http_client_handle_t client = NULL;
     esp_ota_handle_t ota_handle = 0;
     const esp_partition_t *update_partition = NULL;

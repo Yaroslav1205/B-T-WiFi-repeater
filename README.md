@@ -10,6 +10,7 @@ ESP32-C3 Wi-Fi repeater project in `AP + STA` mode with:
 - NVS-persisted transmit power level
 - client table with MAC and RSSI
 - status LED that shows uplink state and connected client count
+- OTA firmware updates from GitHub Releases
 
 ## Project structure
 
@@ -72,3 +73,29 @@ Default web login:
 user: admin
 pass: change-me
 ```
+
+## OTA updates through GitHub
+
+The firmware checker now uses the latest GitHub release assets from this repository:
+
+- manifest: `https://github.com/Yaroslav1205/B-T-WiFi-repeater/releases/latest/download/repeater-ota-manifest.txt`
+- firmware binary: `https://github.com/Yaroslav1205/B-T-WiFi-repeater/releases/latest/download/repeater-firmware.bin`
+
+How publishing works:
+
+1. Update `PROJECT_FIRMWARE_VERSION` in `main/project_wifi_config.h`.
+2. Commit and push the change.
+3. Create a matching tag like `v1.0.1`.
+4. Push the tag to GitHub.
+
+Example:
+
+```bash
+git add .
+git commit -m "Release firmware v1.0.1"
+git push origin main
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+The GitHub Actions workflow `.github/workflows/release-firmware.yml` will build `softap_sta.bin`, generate the OTA manifest, and upload both assets to the tagged GitHub release. The repeater web UI can then check for updates and install the newest release over the air.

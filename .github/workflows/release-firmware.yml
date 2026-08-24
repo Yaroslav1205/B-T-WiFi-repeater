@@ -1,0 +1,63 @@
+name: Release firmware
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  FW_ASSET_NAME: repeater-firmware.bin
+  MANIFEST_ASSET_NAME: repeater-ota-manifest.txt
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.4
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        run: idf.py build
+
+      - name: Read firmware version
+        run: |
+          version="$(grep 'PROJECT_FIRMWARE_VERSION' main/project_wifi_config.h | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "${version}" ]; then
+            echo "Failed to read PROJECT_FIRMWARE_VERSION" >&2
+            exit 1
+          fi
+          echo "FIRMWARE_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Verify tag matches firmware version
+        run: |
+          expected_tag="v${FIRMWARE_VERSION}"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match ${expected_tag}" >&2
+            exit 1
+          fi
+
+      - name: Prepare OTA assets
+        run: |
+          mkdir -p dist
+          cp build/softap_sta.bin "dist/${FW_ASSET_NAME}"
+          cat > "dist/${MANIFEST_ASSET_NAME}" <<EOF
+          version=${FIRMWARE_VERSION}
+          firmware_url=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${FW_ASSET_NAME}
+          EOF
+
+      - name: Create or update GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" \
+            "dist/${FW_ASSET_NAME}" \
+            "dist/${MANIFEST_ASSET_NAME}" \
+            --clobber

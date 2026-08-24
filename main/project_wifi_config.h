@@ -5,7 +5,7 @@
 
 /* Project metadata */
 #define PROJECT_DEVICE_NAME                 "B-T WiFi repeater"
-#define PROJECT_FIRMWARE_VERSION            "1.0.0"
+#define PROJECT_FIRMWARE_VERSION            "1.0.1"
 
 /* Station configuration */
 #define PROJECT_WIFI_STA_SSID                "YOUR_UPSTREAM_WIFI"
@@ -58,6 +58,6 @@
 #define PROJECT_WEB_AUTH_PASSWORD           "change-me"
 
 /* Firmware update server */
-#define PROJECT_FIRMWARE_MANIFEST_URL       ""
+#define PROJECT_FIRMWARE_MANIFEST_URL       "https://github.com/Yaroslav1205/B-T-WiFi-repeater/releases/latest/download/repeater-ota-manifest.txt"
 #define PROJECT_FIRMWARE_HTTP_TIMEOUT_MS    10000
 #define PROJECT_FIRMWARE_REBOOT_DELAY_MS    2000
