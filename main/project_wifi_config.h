@@ -5,7 +5,7 @@
 
 /* Project metadata */
 #define PROJECT_DEVICE_NAME                 "B-T WiFi repeater"
-#define PROJECT_FIRMWARE_VERSION            "1.0.3"
+#define PROJECT_FIRMWARE_VERSION            "1.0.5"
 
 /* Station configuration */
 #define PROJECT_WIFI_STA_SSID                "TP-Link_8B91"
