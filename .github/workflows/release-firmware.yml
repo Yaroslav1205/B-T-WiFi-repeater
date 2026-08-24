@@ -86,10 +86,11 @@ jobs:
       - name: Create or update GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "${RELEASE_TAG}" >/dev/null 2>&1 || \
-            gh release create "${RELEASE_TAG}" --title "${RELEASE_TAG}" --generate-notes
-          gh release upload "${RELEASE_TAG}" \
+          gh release view "${RELEASE_TAG}" --repo "${GH_REPO}" >/dev/null 2>&1 || \
+            gh release create "${RELEASE_TAG}" --repo "${GH_REPO}" --title "${RELEASE_TAG}" --generate-notes
+          gh release upload "${RELEASE_TAG}" --repo "${GH_REPO}" \
             "dist/${FW_ASSET_NAME}" \
             "dist/${MANIFEST_ASSET_NAME}" \
             --clobber
