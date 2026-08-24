@@ -5,11 +5,11 @@
 
 /* Project metadata */
 #define PROJECT_DEVICE_NAME                 "B-T WiFi repeater"
-#define PROJECT_FIRMWARE_VERSION            "1.0.1"
+#define PROJECT_FIRMWARE_VERSION            "1.0.2"
 
 /* Station configuration */
-#define PROJECT_WIFI_STA_SSID                "YOUR_UPSTREAM_WIFI"
-#define PROJECT_WIFI_STA_PASSWORD            "CHANGE_ME"
+#define PROJECT_WIFI_STA_SSID                "TP-Link_8B91"
+#define PROJECT_WIFI_STA_PASSWORD            "12341234"
 #define PROJECT_WIFI_STA_BACKUP_ENABLED      false
 #define PROJECT_WIFI_STA_BACKUP_SSID         ""
 #define PROJECT_WIFI_STA_BACKUP_PASSWORD     ""
@@ -18,8 +18,8 @@
 #define PROJECT_WIFI_STA_SCAN_AUTH_MODE      WIFI_AUTH_WPA2_PSK
 
 /* SoftAP configuration */
-#define PROJECT_WIFI_AP_SSID                 "B-T-Repeater-Setup"
-#define PROJECT_WIFI_AP_PASSWORD             "change-me-1234"
+#define PROJECT_WIFI_AP_SSID                 "TP-Link_8B93"
+#define PROJECT_WIFI_AP_PASSWORD             "12341234"
 #define PROJECT_WIFI_AP_AUTH_MODE            WIFI_AUTH_WPA_WPA2_PSK
 #define PROJECT_WIFI_AP_CHANNEL              1
 #define PROJECT_WIFI_AP_MAX_STA_CONN         4
@@ -55,7 +55,7 @@
 
 /* Web UI authentication. Change these values here when needed. */
 #define PROJECT_WEB_AUTH_USERNAME           "admin"
-#define PROJECT_WEB_AUTH_PASSWORD           "change-me"
+#define PROJECT_WEB_AUTH_PASSWORD           "admin"
 
 /* Firmware update server */
 #define PROJECT_FIRMWARE_MANIFEST_URL       "https://github.com/Yaroslav1205/B-T-WiFi-repeater/releases/latest/download/repeater-ota-manifest.txt"
