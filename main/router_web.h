@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
@@ -18,6 +19,9 @@ typedef struct {
     bool (*is_using_backup_upstream)(void);
     const char *(*get_active_upstream_ssid)(void);
     esp_err_t (*get_upstream_ip_info)(esp_netif_ip_info_t *out_ip_info);
+    int64_t (*get_upstream_connected_at_epoch)(void);
+    esp_err_t (*get_upstream_packet_counts)(uint32_t *out_rx_packets,
+                                            uint32_t *out_tx_packets);
     int (*get_client_count)(void);
     size_t (*get_clients)(repeater_client_info_t *clients, size_t max_clients);
     const char *(*get_signal_level_label)(void);

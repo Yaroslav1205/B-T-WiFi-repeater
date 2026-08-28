@@ -334,6 +334,21 @@ static void set_default_web_auth_config(void)
               sizeof(s_web_auth_config.password));
 }
 
+static void set_runtime_defaults(bool preserve_client_history)
+{
+    s_tx_power_quarter_dbm = PROJECT_DEFAULT_TX_POWER_QUARTER_DBM;
+    set_default_theme_token();
+    set_default_auto_reboot_config();
+    set_default_station_config();
+    set_default_backup_station_config();
+    set_default_softap_config();
+    set_default_web_auth_config();
+
+    if (!preserve_client_history) {
+        clear_client_history();
+    }
+}
+
 static esp_err_t load_client_history_from_store(const repeater_client_history_store_t *store)
 {
     clear_client_history();
@@ -579,6 +594,17 @@ static esp_err_t save_web_auth_to_nvs(nvs_handle_t nvs_handle,
     return ESP_OK;
 }
 
+static esp_err_t erase_key_if_present(nvs_handle_t nvs_handle, const char *key)
+{
+    esp_err_t err = nvs_erase_key(nvs_handle, key);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+
+    return err;
+}
+
 esp_err_t repeater_settings_init(void)
 {
     nvs_handle_t nvs_handle;
@@ -590,14 +616,7 @@ esp_err_t repeater_settings_init(void)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
 
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        s_tx_power_quarter_dbm = PROJECT_DEFAULT_TX_POWER_QUARTER_DBM;
-        set_default_theme_token();
-        set_default_auto_reboot_config();
-        set_default_station_config();
-        set_default_backup_station_config();
-        set_default_softap_config();
-        set_default_web_auth_config();
-        clear_client_history();
+        set_runtime_defaults(false);
         ESP_LOGI(TAG, "No saved signal level in NVS, using default: %s",
                  repeater_settings_get_signal_level_label());
         ESP_LOGI(TAG, "No saved theme in NVS, using default: %s",
@@ -878,6 +897,64 @@ esp_err_t repeater_settings_init(void)
     }
 
     nvs_close(nvs_handle);
+    return ESP_OK;
+}
+
+esp_err_t repeater_settings_factory_reset(void)
+{
+    nvs_handle_t nvs_handle;
+
+    set_runtime_defaults(true);
+
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
+                        "Failed to open NVS for factory reset");
+    esp_err_t err = erase_key_if_present(nvs_handle, NVS_KEY_TX_POWER);
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_THEME);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_REBOOT_EN);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_REBOOT_H);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_REBOOT_M);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_STA_SSID);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_STA_PASS);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_STA_B_SSID);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_STA_B_PASS);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_AP_SSID);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_AP_PASS);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_AP_AUTH);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_WEB_USER);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_WEB_PASS);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+    nvs_close(nvs_handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to erase saved settings");
+
+    ESP_LOGW(TAG, "Factory reset completed; saved settings restored to defaults while keeping client history");
     return ESP_OK;
 }
 

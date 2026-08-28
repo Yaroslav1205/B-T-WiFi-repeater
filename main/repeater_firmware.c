@@ -18,6 +18,8 @@
 #define FIRMWARE_MANIFEST_BUFFER_SIZE 1024
 #define FIRMWARE_URL_MAX_LEN 256
 #define FIRMWARE_HTTP_READ_BUFFER_SIZE 1024
+#define FIRMWARE_HTTP_HEADER_BUFFER_SIZE 2048
+#define FIRMWARE_HTTP_TX_BUFFER_SIZE 1024
 #define FIRMWARE_HTTP_MAX_REDIRECTS 5
 #define FIRMWARE_UPDATE_TASK_STACK_SIZE 8192
 
@@ -117,10 +119,60 @@ static esp_http_client_config_t repeater_firmware_make_http_config(const char *u
         .method = HTTP_METHOD_GET,
         .timeout_ms = PROJECT_FIRMWARE_HTTP_TIMEOUT_MS,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .user_agent = "B-T-WiFi-Repeater-OTA",
+        .buffer_size = FIRMWARE_HTTP_HEADER_BUFFER_SIZE,
+        .buffer_size_tx = FIRMWARE_HTTP_TX_BUFFER_SIZE,
         .max_redirection_count = FIRMWARE_HTTP_MAX_REDIRECTS,
     };
 
     return config;
+}
+
+static esp_err_t repeater_firmware_open_http_response(esp_http_client_handle_t client)
+{
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "HTTP client handle is required");
+
+    for (int redirect_count = 0; redirect_count <= FIRMWARE_HTTP_MAX_REDIRECTS; ++redirect_count) {
+        err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        int64_t header_length = esp_http_client_fetch_headers(client);
+        if (header_length < 0) {
+            ESP_LOGE(TAG, "HTTP fetch headers failed: %lld", (long long)header_length);
+            esp_http_client_close(client);
+            return ESP_FAIL;
+        }
+
+        const int status_code = esp_http_client_get_status_code(client);
+        if (status_code >= 300 && status_code < 400) {
+            ESP_LOGW(TAG, "Following OTA redirect %d/%d, status=%d",
+                     redirect_count + 1, FIRMWARE_HTTP_MAX_REDIRECTS, status_code);
+            err = esp_http_client_set_redirection(client);
+            esp_http_client_close(client);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to set OTA redirect URL: %s", esp_err_to_name(err));
+                return err;
+            }
+            continue;
+        }
+
+        if (status_code != 200) {
+            ESP_LOGE(TAG, "Unexpected OTA HTTP status: %d", status_code);
+            esp_http_client_close(client);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Exceeded maximum OTA redirect count");
+    return ESP_ERR_HTTP_MAX_REDIRECT;
 }
 
 static int repeater_firmware_read_version_segment(const char **cursor)
@@ -184,23 +236,10 @@ static esp_err_t repeater_firmware_http_get_text(const char *url, char *buffer, 
     client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_FAIL, TAG, "Failed to create HTTP client");
 
-    err = esp_http_client_open(client, 0);
+    err = repeater_firmware_open_http_response(client);
     if (err != ESP_OK) {
         esp_http_client_cleanup(client);
         return err;
-    }
-
-    err = esp_http_client_fetch_headers(client);
-    if (err < 0) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
-    }
-
-    if (esp_http_client_get_status_code(client) != 200) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_ERR_INVALID_RESPONSE;
     }
 
     while (total_read < (int)buffer_size - 1) {
@@ -377,19 +416,8 @@ static esp_err_t repeater_firmware_download_and_apply(const char *firmware_url)
     client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_FAIL, TAG, "Failed to create HTTP client");
 
-    err = esp_http_client_open(client, 0);
+    err = repeater_firmware_open_http_response(client);
     if (err != ESP_OK) {
-        goto cleanup;
-    }
-
-    err = esp_http_client_fetch_headers(client);
-    if (err < 0) {
-        err = ESP_FAIL;
-        goto cleanup;
-    }
-
-    if (esp_http_client_get_status_code(client) != 200) {
-        err = ESP_ERR_INVALID_RESPONSE;
         goto cleanup;
     }
 
@@ -574,3 +602,6 @@ esp_err_t repeater_firmware_start_update(void)
     repeater_firmware_status_unlock();
     return ESP_OK;
 }
+
+
+

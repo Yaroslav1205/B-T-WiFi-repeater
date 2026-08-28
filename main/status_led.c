@@ -9,11 +9,24 @@
 static const char *TAG = "StatusLED";
 static status_led_context_t s_context;
 static TaskHandle_t s_status_led_task_handle;
+static const TickType_t STATUS_LED_STARTUP_BLINK_ON_TICKS = pdMS_TO_TICKS(40);
+static const TickType_t STATUS_LED_STARTUP_BLINK_OFF_TICKS = pdMS_TO_TICKS(60);
+static const int STATUS_LED_STARTUP_BLINK_COUNT = 10;
 
 static void status_led_set(bool on)
 {
     gpio_set_level(PROJECT_STATUS_LED_GPIO,
                    on ? PROJECT_STATUS_LED_ACTIVE_LEVEL : !PROJECT_STATUS_LED_ACTIVE_LEVEL);
+}
+
+static void status_led_run_startup_pattern(void)
+{
+    for (int i = 0; i < STATUS_LED_STARTUP_BLINK_COUNT; ++i) {
+        status_led_set(true);
+        vTaskDelay(STATUS_LED_STARTUP_BLINK_ON_TICKS);
+        status_led_set(false);
+        vTaskDelay(STATUS_LED_STARTUP_BLINK_OFF_TICKS);
+    }
 }
 
 static void status_led_task(void *arg)
@@ -69,6 +82,7 @@ esp_err_t status_led_start(const status_led_context_t *context)
 
     ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "Failed to configure status LED GPIO");
     status_led_set(false);
+    status_led_run_startup_pattern();
 
     task_result = xTaskCreate(status_led_task, "status_led_task", 2048, NULL, 1,
                               &s_status_led_task_handle);

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -9,6 +10,8 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,6 +32,128 @@ static const char *TAG = "RepeaterWiFi";
 static const char *TAG_AP = "RepeaterAP";
 static const char *TAG_STA = "RepeaterSTA";
 static repeater_runtime_t *s_runtime;
+static esp_timer_handle_t s_sta_reconnect_timer;
+
+static bool repeater_wifi_is_using_backup_profile(void);
+static const char *repeater_wifi_get_station_role_name(bool use_backup);
+static const char *repeater_wifi_get_upstream_ssid(void);
+
+static bool repeater_wifi_is_system_time_valid(time_t now)
+{
+    struct tm time_info;
+
+    if (now <= 0 || localtime_r(&now, &time_info) == NULL) {
+        return false;
+    }
+
+    return time_info.tm_year >= (2024 - 1900);
+}
+
+static int64_t repeater_wifi_read_current_epoch_if_valid(void)
+{
+    const time_t now = time(NULL);
+
+    return repeater_wifi_is_system_time_valid(now) ? (int64_t)now : 0;
+}
+
+static void repeater_wifi_mark_upstream_connected(void)
+{
+    if (s_runtime == NULL) {
+        return;
+    }
+
+    s_runtime->upstream_connected_monotonic_us = esp_timer_get_time();
+    s_runtime->upstream_connected_at_epoch = repeater_wifi_read_current_epoch_if_valid();
+}
+
+static uint32_t repeater_wifi_get_reconnect_delay_ms(bool initial_attempt, int retry_count)
+{
+    if (initial_attempt) {
+        return PROJECT_WIFI_STA_INITIAL_CONNECT_DELAY_MS;
+    }
+
+    const int retry_index = retry_count > 0 ? retry_count - 1 : 0;
+    const uint32_t delay_ms = PROJECT_WIFI_STA_RETRY_DELAY_MS +
+        (uint32_t)retry_index * PROJECT_WIFI_STA_RETRY_BACKOFF_STEP_MS;
+
+    return delay_ms > PROJECT_WIFI_STA_RETRY_DELAY_MAX_MS
+        ? PROJECT_WIFI_STA_RETRY_DELAY_MAX_MS
+        : delay_ms;
+}
+
+static void repeater_wifi_cancel_scheduled_reconnect(void)
+{
+    if (s_sta_reconnect_timer == NULL) {
+        return;
+    }
+
+    esp_err_t err = esp_timer_stop(s_sta_reconnect_timer);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG_STA, "Failed to stop reconnect timer: %s", esp_err_to_name(err));
+    }
+}
+
+static void repeater_wifi_reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+
+    if (s_runtime == NULL) {
+        return;
+    }
+
+    ESP_LOGI(TAG_STA, "Attempting upstream connection to %s SSID: %s",
+             repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
+             repeater_wifi_get_upstream_ssid());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+}
+
+static esp_err_t repeater_wifi_ensure_reconnect_timer(void)
+{
+    if (s_sta_reconnect_timer != NULL) {
+        return ESP_OK;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = repeater_wifi_reconnect_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "sta_reconnect",
+        .skip_unhandled_events = true,
+    };
+
+    return esp_timer_create(&timer_args, &s_sta_reconnect_timer);
+}
+
+static void repeater_wifi_schedule_reconnect(bool initial_attempt)
+{
+    const uint32_t delay_ms = repeater_wifi_get_reconnect_delay_ms(initial_attempt,
+                                                                   s_runtime != NULL ? s_runtime->retry_count : 0);
+
+    if (repeater_wifi_ensure_reconnect_timer() != ESP_OK) {
+        ESP_LOGW(TAG_STA, "Reconnect timer unavailable, connecting immediately");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        return;
+    }
+
+    repeater_wifi_cancel_scheduled_reconnect();
+    ESP_LOGI(TAG_STA, "%s upstream connect scheduled in %lu ms for %s SSID: %s",
+             initial_attempt ? "Initial" : "Retry",
+             (unsigned long)delay_ms,
+             repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
+             repeater_wifi_get_upstream_ssid());
+
+    if (delay_ms == 0) {
+        repeater_wifi_reconnect_timer_cb(NULL);
+        return;
+    }
+
+    esp_err_t err = esp_timer_start_once(s_sta_reconnect_timer, (uint64_t)delay_ms * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_STA, "Failed to start reconnect timer: %s. Connecting immediately",
+                 esp_err_to_name(err));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    }
+}
 
 static const repeater_station_config_t *repeater_wifi_get_primary_station_config(void)
 {
@@ -97,6 +222,67 @@ static int repeater_wifi_get_probe_failure_threshold(void)
         : PROJECT_UPSTREAM_PROBE_FAILURE_THRESHOLD;
 }
 
+static int64_t repeater_wifi_read_monotonic_us(void)
+{
+    return esp_timer_get_time();
+}
+
+static void repeater_wifi_begin_timeout_window(int64_t *started_at_monotonic_us)
+{
+    if (started_at_monotonic_us == NULL || *started_at_monotonic_us > 0) {
+        return;
+    }
+
+    *started_at_monotonic_us = repeater_wifi_read_monotonic_us();
+}
+
+static void repeater_wifi_clear_timeout_window(int64_t *started_at_monotonic_us)
+{
+    if (started_at_monotonic_us == NULL) {
+        return;
+    }
+
+    *started_at_monotonic_us = 0;
+}
+
+static int64_t repeater_wifi_elapsed_ms_since(int64_t started_at_monotonic_us, int64_t now_monotonic_us)
+{
+    if (started_at_monotonic_us <= 0 || now_monotonic_us <= started_at_monotonic_us) {
+        return 0;
+    }
+
+    return (now_monotonic_us - started_at_monotonic_us) / 1000LL;
+}
+
+static bool repeater_wifi_timeout_expired(int64_t started_at_monotonic_us, int64_t timeout_ms,
+                                          int64_t now_monotonic_us)
+{
+    return started_at_monotonic_us > 0 &&
+        repeater_wifi_elapsed_ms_since(started_at_monotonic_us, now_monotonic_us) >= timeout_ms;
+}
+
+static void repeater_wifi_restart_like_power_cycle(const char *reason)
+{
+    ESP_LOGE(TAG, "Failsafe reboot requested: %s", reason != NULL ? reason : "unknown reason");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
+}
+
+static int repeater_wifi_refresh_active_client_count(void)
+{
+    wifi_sta_list_t sta_list = { 0 };
+
+    if (s_runtime == NULL) {
+        return 0;
+    }
+
+    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+        s_runtime->ap_client_count = sta_list.num;
+    }
+
+    return s_runtime->ap_client_count;
+}
+
 static const repeater_station_config_t *repeater_wifi_get_station_config_for_profile(bool use_backup)
 {
     if (use_backup && repeater_wifi_has_backup_station()) {
@@ -138,23 +324,174 @@ static void repeater_wifi_reset_upstream_state(void)
     s_runtime->sta_has_upstream_connection = false;
 }
 
+static void repeater_wifi_failsafe_reboot_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        const int64_t now_monotonic_us = repeater_wifi_read_monotonic_us();
+
+        if (PROJECT_FAILSAFE_REBOOT_ENABLED && s_runtime != NULL) {
+            const int active_client_count = repeater_wifi_refresh_active_client_count();
+
+            if (active_client_count > 0) {
+                repeater_wifi_clear_timeout_window(&s_runtime->no_client_since_monotonic_us);
+            } else {
+                repeater_wifi_begin_timeout_window(&s_runtime->no_client_since_monotonic_us);
+            }
+
+            if (repeater_wifi_timeout_expired(s_runtime->upstream_unavailable_since_monotonic_us,
+                                              PROJECT_FAILSAFE_REBOOT_TIMEOUT_MS,
+                                              now_monotonic_us)) {
+                const int64_t elapsed_ms = repeater_wifi_elapsed_ms_since(
+                    s_runtime->upstream_unavailable_since_monotonic_us, now_monotonic_us);
+
+                ESP_LOGE(TAG_STA,
+                         "No upstream IP for %lld ms on %s SSID=%s, forcing reboot",
+                         elapsed_ms,
+                         repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
+                         repeater_wifi_get_upstream_ssid());
+                repeater_wifi_restart_like_power_cycle("upstream unavailable for too long");
+            }
+
+            if (repeater_wifi_timeout_expired(s_runtime->no_client_since_monotonic_us,
+                                              PROJECT_FAILSAFE_REBOOT_TIMEOUT_MS,
+                                              now_monotonic_us)) {
+                const int64_t elapsed_ms = repeater_wifi_elapsed_ms_since(
+                    s_runtime->no_client_since_monotonic_us, now_monotonic_us);
+
+                ESP_LOGW(TAG_AP,
+                         "No SoftAP clients connected for %lld ms, forcing reboot",
+                         elapsed_ms);
+                repeater_wifi_restart_like_power_cycle("no SoftAP clients for too long");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(PROJECT_FAILSAFE_REBOOT_CHECK_INTERVAL_MS));
+    }
+}
+
 static const char *wifi_disconnect_reason_to_str(uint8_t reason)
 {
     switch (reason) {
     case WIFI_REASON_AUTH_EXPIRE:
         return "auth expired";
+    case WIFI_REASON_AUTH_LEAVE:
+        return "auth leave";
     case WIFI_REASON_AUTH_FAIL:
         return "auth failed";
+    case WIFI_REASON_ASSOC_EXPIRE:
+        return "assoc expired";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "assoc too many";
+    case WIFI_REASON_NOT_AUTHED:
+        return "not authed";
+    case WIFI_REASON_NOT_ASSOCED:
+        return "not assoced";
+    case WIFI_REASON_ASSOC_LEAVE:
+        return "assoc leave";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+        return "assoc not authed";
     case WIFI_REASON_NO_AP_FOUND:
         return "AP not found";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "4-way handshake timeout";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+        return "group key update timeout";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+        return "RSN IE differs in 4-way handshake";
+    case WIFI_REASON_GROUP_CIPHER_INVALID:
+        return "group cipher invalid";
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+        return "pairwise cipher invalid";
+    case WIFI_REASON_AKMP_INVALID:
+        return "AKMP invalid";
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+        return "unsupported RSN IE version";
+    case WIFI_REASON_INVALID_RSN_IE_CAP:
+        return "invalid RSN IE capabilities";
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+        return "802.1X auth failed";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:
+        return "cipher suite rejected";
     case WIFI_REASON_HANDSHAKE_TIMEOUT:
         return "handshake timeout";
     case WIFI_REASON_BEACON_TIMEOUT:
         return "beacon timeout";
     case WIFI_REASON_ASSOC_FAIL:
         return "association failed";
+#ifdef WIFI_REASON_CONNECTION_FAIL
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "connection failed";
+#endif
+#ifdef WIFI_REASON_AP_TSF_RESET
+    case WIFI_REASON_AP_TSF_RESET:
+        return "AP TSF reset";
+#endif
     default:
         return "other";
+    }
+}
+
+static const char *wifi_disconnect_reason_detail(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "the access point did not complete authentication in time";
+    case WIFI_REASON_AUTH_LEAVE:
+        return "the access point or client left during authentication";
+    case WIFI_REASON_AUTH_FAIL:
+        return "authentication was rejected, often due to a wrong password or unsupported security mode";
+    case WIFI_REASON_ASSOC_EXPIRE:
+        return "association did not complete before timeout";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "the access point rejected the client because too many stations are already connected";
+    case WIFI_REASON_NOT_AUTHED:
+        return "the station tried to continue before successful authentication";
+    case WIFI_REASON_NOT_ASSOCED:
+        return "the station is not associated with the access point";
+    case WIFI_REASON_ASSOC_LEAVE:
+        return "the association ended while joining the access point";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+        return "association was rejected because authentication was not accepted";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "the configured SSID was not found on the air";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "the WPA 4-way handshake did not complete, often due to a password or WPA compatibility issue";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+        return "group key negotiation timed out after association";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+        return "the RSN security parameters changed during WPA negotiation";
+    case WIFI_REASON_GROUP_CIPHER_INVALID:
+        return "the access point rejected the configured group cipher";
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+        return "the access point rejected the configured pairwise cipher";
+    case WIFI_REASON_AKMP_INVALID:
+        return "the authentication or key-management suite is not accepted by the access point";
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+        return "the access point reported an unsupported RSN information element version";
+    case WIFI_REASON_INVALID_RSN_IE_CAP:
+        return "the RSN capabilities reported by the access point are not accepted";
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+        return "802.1X or enterprise authentication failed";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:
+        return "the access point rejected the offered cipher suite";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "key handshake timed out, often due to weak signal or WPA mismatch";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "the station stopped hearing beacons from the access point";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "the access point rejected association after authentication";
+#ifdef WIFI_REASON_CONNECTION_FAIL
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "the driver could not finish the connection sequence";
+#endif
+#ifdef WIFI_REASON_AP_TSF_RESET
+    case WIFI_REASON_AP_TSF_RESET:
+        return "the access point timing changed unexpectedly during connection";
+#endif
+    default:
+        return "the Wi-Fi stack reported an unclassified disconnect reason";
     }
 }
 
@@ -180,6 +517,11 @@ static const char *wifi_auth_mode_to_str(wifi_auth_mode_t auth_mode)
     default:
         return "unknown";
     }
+}
+
+static const char *repeater_wifi_get_softap_channel_label(void)
+{
+    return PROJECT_WIFI_AP_CHANNEL == 0 ? "auto" : "fixed";
 }
 
 static void repeater_wifi_format_mac_uppercase(char *output, size_t output_size,
@@ -263,8 +605,9 @@ static esp_err_t repeater_apply_station_config_for_profile(bool use_backup, bool
 
     if (reconnect_now) {
         repeater_wifi_reset_upstream_state();
+        repeater_wifi_cancel_scheduled_reconnect();
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        repeater_wifi_schedule_reconnect(false);
     }
 
     ESP_LOGI(TAG_STA, "Station configured. Role=%s SSID=%s",
@@ -511,8 +854,9 @@ static void repeater_wifi_event_handler(void *arg, esp_event_base_t event_base,
         repeater_wifi_format_mac_uppercase(mac_text, sizeof(mac_text), event->mac);
         ESP_ERROR_CHECK_WITHOUT_ABORT(repeater_settings_record_client_connection(mac_text));
         ++s_runtime->ap_client_count;
+        repeater_wifi_clear_timeout_window(&s_runtime->no_client_since_monotonic_us);
         ESP_LOGI(TAG_AP, "Station %s joined, AID=%d", mac_text, event->aid);
-        ESP_LOGI(TAG_AP, "Connected SoftAP clients: %d", s_runtime->ap_client_count);
+        ESP_LOGI(TAG_AP, "Connected SoftAP clients: %d", repeater_wifi_refresh_active_client_count());
         return;
     }
 
@@ -524,16 +868,25 @@ static void repeater_wifi_event_handler(void *arg, esp_event_base_t event_base,
         if (s_runtime->ap_client_count > 0) {
             --s_runtime->ap_client_count;
         }
+        if (s_runtime->ap_client_count == 0) {
+            repeater_wifi_begin_timeout_window(&s_runtime->no_client_since_monotonic_us);
+        }
 
         ESP_LOGI(TAG_AP, "Station %s left, AID=%d, reason=%d",
                  mac_text, event->aid, event->reason);
-        ESP_LOGI(TAG_AP, "Connected SoftAP clients: %d", s_runtime->ap_client_count);
+        ESP_LOGI(TAG_AP, "Connected SoftAP clients: %d", repeater_wifi_refresh_active_client_count());
         return;
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
-        ESP_LOGI(TAG_STA, "Station started, connecting to %s upstream SSID: %s",
+        repeater_wifi_schedule_reconnect(true);
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        repeater_wifi_cancel_scheduled_reconnect();
+        repeater_wifi_mark_upstream_connected();
+        ESP_LOGI(TAG_STA, "Associated with %s upstream SSID: %s",
                  repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
                  repeater_wifi_get_upstream_ssid());
         return;
@@ -546,34 +899,39 @@ static void repeater_wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_runtime->sta_has_ip_address = false;
         s_runtime->sta_has_upstream_connection = false;
         s_runtime->upstream_probe_failure_count = 0;
+        repeater_wifi_begin_timeout_window(&s_runtime->upstream_unavailable_since_monotonic_us);
 
         if (s_runtime->retry_count < PROJECT_WIFI_STA_MAXIMUM_RETRY) {
             ++s_runtime->retry_count;
-            ESP_LOGW(TAG_STA, "Upstream disconnect, retry %d/%d, reason=%u (%s)",
+            ESP_LOGW(TAG_STA, "Upstream disconnect, retry %d/%d, reason=%u (%s): %s",
                      s_runtime->retry_count, PROJECT_WIFI_STA_MAXIMUM_RETRY,
-                     event->reason, wifi_disconnect_reason_to_str(event->reason));
+                     event->reason, wifi_disconnect_reason_to_str(event->reason),
+                     wifi_disconnect_reason_detail(event->reason));
         } else {
             ESP_LOGW(TAG_STA, "Upstream still unavailable after %d retries, continuing reconnect loop",
                      PROJECT_WIFI_STA_MAXIMUM_RETRY);
-            ESP_LOGW(TAG_STA, "Last disconnect reason=%u (%s)",
-                     event->reason, wifi_disconnect_reason_to_str(event->reason));
+            ESP_LOGW(TAG_STA, "Last disconnect reason=%u (%s): %s",
+                     event->reason, wifi_disconnect_reason_to_str(event->reason),
+                     wifi_disconnect_reason_detail(event->reason));
         }
 
         if (s_runtime->retry_count >= failover_threshold) {
             (void)repeater_switch_to_alternate_upstream("disconnect retry threshold reached", false);
         }
 
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        repeater_wifi_schedule_reconnect(false);
 
         return;
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
+        repeater_wifi_cancel_scheduled_reconnect();
         s_runtime->sta_has_ip_address = true;
         s_runtime->sta_has_upstream_connection = false;
         s_runtime->retry_count = 0;
         s_runtime->upstream_probe_failure_count = 0;
+        repeater_wifi_clear_timeout_window(&s_runtime->upstream_unavailable_since_monotonic_us);
         repeater_handle_upstream_ready(event);
         ESP_LOGI(TAG_STA, "Checking upstream internet access via %s", PROJECT_UPSTREAM_PROBE_URL);
         return;
@@ -620,6 +978,20 @@ static esp_err_t repeater_start_internet_probe(void)
     return ESP_OK;
 }
 
+static esp_err_t repeater_start_failsafe_reboot_monitor(void)
+{
+    if (!PROJECT_FAILSAFE_REBOOT_ENABLED || s_runtime->failsafe_reboot_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    BaseType_t task_result = xTaskCreate(repeater_wifi_failsafe_reboot_task, "failsafe_reboot",
+                                         3072, NULL, 1, &s_runtime->failsafe_reboot_task_handle);
+
+    ESP_RETURN_ON_FALSE(task_result == pdPASS, ESP_FAIL, TAG,
+                        "Failed to create failsafe reboot task");
+    return ESP_OK;
+}
+
 static esp_err_t repeater_apply_softap_config(void)
 {
     wifi_config_t wifi_ap_config = { 0 };
@@ -641,8 +1013,9 @@ static esp_err_t repeater_apply_softap_config(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config), TAG_AP,
                         "Failed to configure SoftAP");
 
-    ESP_LOGI(TAG_AP, "SoftAP configured. SSID=%s channel=%d max_clients=%d",
-             softap_config->ssid, PROJECT_WIFI_AP_CHANNEL, PROJECT_WIFI_AP_MAX_STA_CONN);
+    ESP_LOGI(TAG_AP, "SoftAP configured. SSID=%s channel=%d (%s) max_clients=%d",
+             softap_config->ssid, PROJECT_WIFI_AP_CHANNEL,
+             repeater_wifi_get_softap_channel_label(), PROJECT_WIFI_AP_MAX_STA_CONN);
     ESP_LOGI(TAG_AP, "SoftAP security mode: %s",
              wifi_auth_mode_to_str(wifi_ap_config.ap.authmode));
     return ESP_OK;
@@ -662,6 +1035,8 @@ static esp_err_t repeater_init_station(void)
     s_runtime->sta_netif = esp_netif_create_default_wifi_sta();
     ESP_RETURN_ON_FALSE(s_runtime->sta_netif != NULL, ESP_FAIL, TAG_STA,
                         "Failed to create station netif");
+    ESP_RETURN_ON_ERROR(esp_netif_set_hostname(s_runtime->sta_netif, PROJECT_WIFI_STA_HOSTNAME),
+                        TAG_STA, "Failed to set station hostname");
 
     return repeater_apply_station_config_for_profile(false, false);
 }
@@ -676,6 +1051,11 @@ esp_err_t repeater_wifi_start(repeater_runtime_t *runtime)
     s_runtime->sta_using_backup_connection = false;
     s_runtime->retry_count = 0;
     s_runtime->upstream_probe_failure_count = 0;
+    s_runtime->upstream_connected_at_epoch = 0;
+    s_runtime->upstream_connected_monotonic_us = 0;
+    s_runtime->upstream_unavailable_since_monotonic_us = repeater_wifi_read_monotonic_us();
+    s_runtime->no_client_since_monotonic_us = repeater_wifi_read_monotonic_us();
+    s_runtime->packet_stats_enabled = false;
 
     if (PROJECT_WIFI_STA_BACKUP_ENABLED && repeater_wifi_backup_matches_primary()) {
         ESP_LOGW(TAG_STA, "Backup upstream matches primary credentials, automatic failover is disabled");
@@ -683,6 +1063,8 @@ esp_err_t repeater_wifi_start(repeater_runtime_t *runtime)
 
     ESP_RETURN_ON_ERROR(repeater_register_event_handlers(), TAG,
                         "Failed to register event handlers");
+    ESP_RETURN_ON_ERROR(repeater_wifi_ensure_reconnect_timer(), TAG,
+                        "Failed to create delayed STA reconnect timer");
     ESP_RETURN_ON_ERROR(esp_wifi_init(&wifi_init_config), TAG, "Failed to initialize Wi-Fi");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Failed to disable power save");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG,
@@ -696,6 +1078,8 @@ esp_err_t repeater_wifi_start(repeater_runtime_t *runtime)
                         "Failed to apply saved repeater settings");
     ESP_RETURN_ON_ERROR(repeater_start_internet_probe(), TAG,
                         "Failed to start upstream internet probe");
+    ESP_RETURN_ON_ERROR(repeater_start_failsafe_reboot_monitor(), TAG,
+                        "Failed to start failsafe reboot monitor");
 
     return ESP_OK;
 }
@@ -771,7 +1155,62 @@ const char *repeater_wifi_get_active_upstream_ssid(const repeater_runtime_t *run
         runtime->sta_using_backup_connection && repeater_wifi_has_backup_station())->ssid;
 }
 
+int64_t repeater_wifi_get_upstream_connected_at_epoch(const repeater_runtime_t *runtime)
+{
+    const int64_t now_epoch = repeater_wifi_read_current_epoch_if_valid();
+    int64_t connected_at_epoch;
+    int64_t elapsed_seconds;
+
+    if (runtime == NULL || runtime->upstream_connected_monotonic_us <= 0) {
+        return 0;
+    }
+
+    if (runtime->upstream_connected_at_epoch > 0) {
+        return runtime->upstream_connected_at_epoch;
+    }
+
+    if (now_epoch <= 0) {
+        return 0;
+    }
+
+    elapsed_seconds = (esp_timer_get_time() - runtime->upstream_connected_monotonic_us) / 1000000LL;
+    if (elapsed_seconds < 0 || now_epoch <= elapsed_seconds) {
+        return 0;
+    }
+
+    connected_at_epoch = now_epoch - elapsed_seconds;
+    return connected_at_epoch > 0 ? connected_at_epoch : 0;
+}
+
+esp_err_t repeater_wifi_get_upstream_packet_counts(const repeater_runtime_t *runtime,
+                                                   uint32_t *out_rx_packets,
+                                                   uint32_t *out_tx_packets)
+{
+    ESP_RETURN_ON_FALSE(runtime != NULL, ESP_ERR_INVALID_ARG, TAG, "Runtime is required");
+    ESP_RETURN_ON_FALSE(out_rx_packets != NULL && out_tx_packets != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "Packet counter outputs are required");
+    ESP_RETURN_ON_FALSE(s_runtime == runtime, ESP_ERR_INVALID_STATE, TAG,
+                        "Wi-Fi runtime is not initialized");
+
+    *out_rx_packets = 0;
+    *out_tx_packets = 0;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 int repeater_wifi_get_client_count(const repeater_runtime_t *runtime)
 {
-    return runtime != NULL ? runtime->ap_client_count : 0;
+    if (runtime == NULL) {
+        return 0;
+    }
+
+    if (runtime == s_runtime) {
+        return repeater_wifi_refresh_active_client_count();
+    }
+
+    return runtime->ap_client_count;
 }
+
+
+
+
+

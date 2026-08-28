@@ -76,6 +76,17 @@ static esp_err_t bridge_get_upstream_ip_info(esp_netif_ip_info_t *out_ip_info)
     return repeater_wifi_get_upstream_ip_info(s_runtime, out_ip_info);
 }
 
+static int64_t bridge_get_upstream_connected_at_epoch(void)
+{
+    return repeater_wifi_get_upstream_connected_at_epoch(s_runtime);
+}
+
+static esp_err_t bridge_get_upstream_packet_counts(uint32_t *out_rx_packets,
+                                                   uint32_t *out_tx_packets)
+{
+    return repeater_wifi_get_upstream_packet_counts(s_runtime, out_rx_packets, out_tx_packets);
+}
+
 static int bridge_get_client_count(void)
 {
     return repeater_wifi_get_client_count(s_runtime);
@@ -226,6 +237,8 @@ esp_err_t repeater_web_bridge_start(repeater_runtime_t *runtime)
         .is_using_backup_upstream = bridge_is_using_backup_upstream,
         .get_active_upstream_ssid = bridge_get_active_upstream_ssid,
         .get_upstream_ip_info = bridge_get_upstream_ip_info,
+        .get_upstream_connected_at_epoch = bridge_get_upstream_connected_at_epoch,
+        .get_upstream_packet_counts = bridge_get_upstream_packet_counts,
         .get_client_count = bridge_get_client_count,
         .get_clients = bridge_get_clients,
         .get_signal_level_label = repeater_settings_get_signal_level_label,
@@ -260,3 +273,4 @@ esp_err_t repeater_web_bridge_start(repeater_runtime_t *runtime)
 
     return router_web_start(&web_context, &runtime->http_server);
 }
+

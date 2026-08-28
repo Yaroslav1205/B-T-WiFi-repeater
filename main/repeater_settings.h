@@ -66,6 +66,7 @@ typedef struct {
 } repeater_client_history_entry_t;
 
 esp_err_t repeater_settings_init(void);
+esp_err_t repeater_settings_factory_reset(void);
 esp_err_t repeater_settings_apply(void);
 esp_err_t repeater_settings_set_signal_level_by_token(const char *token);
 esp_err_t repeater_settings_set_theme_by_token(const char *token);
