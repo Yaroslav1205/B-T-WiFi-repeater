@@ -76,6 +76,16 @@ static esp_err_t bridge_get_upstream_ip_info(esp_netif_ip_info_t *out_ip_info)
     return repeater_wifi_get_upstream_ip_info(s_runtime, out_ip_info);
 }
 
+static esp_err_t bridge_get_upstream_rssi(int *out_rssi)
+{
+    return repeater_wifi_get_upstream_rssi(s_runtime, out_rssi);
+}
+
+static esp_err_t bridge_get_upstream_channel(int *out_channel)
+{
+    return repeater_wifi_get_upstream_channel(s_runtime, out_channel);
+}
+
 static int64_t bridge_get_upstream_connected_at_epoch(void)
 {
     return repeater_wifi_get_upstream_connected_at_epoch(s_runtime);
@@ -123,7 +133,8 @@ static esp_err_t bridge_restore_wifi_networks(const repeater_station_config_t *o
                                                             old_backup_station_config->password,
                                                             old_softap_config->ssid,
                                                             old_softap_config->password,
-                                                            old_softap_auth_token),
+                                                            old_softap_auth_token,
+                                                            old_softap_config->ssid_hidden),
                         TAG, "Failed to restore previous Wi-Fi settings in NVS");
 
     if (s_runtime != NULL && s_runtime->started) {
@@ -187,7 +198,8 @@ static esp_err_t bridge_set_wifi_networks(const char *station_ssid,
                                           const char *backup_station_password,
                                           const char *softap_ssid,
                                           const char *softap_password,
-                                          const char *softap_auth_token)
+                                          const char *softap_auth_token,
+                                          bool softap_ssid_hidden)
 {
     const repeater_station_config_t old_station_config = *repeater_settings_get_station_config();
     const repeater_station_config_t old_backup_station_config =
@@ -202,7 +214,8 @@ static esp_err_t bridge_set_wifi_networks(const char *station_ssid,
                                                             backup_station_ssid,
                                                             backup_station_password,
                                                             softap_ssid, softap_password,
-                                                            softap_auth_token),
+                                                            softap_auth_token,
+                                                            softap_ssid_hidden),
                         TAG, "Failed to save Wi-Fi network settings");
 
     if (s_runtime == NULL || !s_runtime->started) {
@@ -237,6 +250,8 @@ esp_err_t repeater_web_bridge_start(repeater_runtime_t *runtime)
         .is_using_backup_upstream = bridge_is_using_backup_upstream,
         .get_active_upstream_ssid = bridge_get_active_upstream_ssid,
         .get_upstream_ip_info = bridge_get_upstream_ip_info,
+        .get_upstream_rssi = bridge_get_upstream_rssi,
+        .get_upstream_channel = bridge_get_upstream_channel,
         .get_upstream_connected_at_epoch = bridge_get_upstream_connected_at_epoch,
         .get_upstream_packet_counts = bridge_get_upstream_packet_counts,
         .get_client_count = bridge_get_client_count,
@@ -247,9 +262,15 @@ esp_err_t repeater_web_bridge_start(repeater_runtime_t *runtime)
         .get_theme_label = repeater_settings_get_theme_label,
         .get_theme_token = repeater_settings_get_theme_token,
         .set_theme_by_token = repeater_settings_set_theme_by_token,
+        .is_status_led_enabled = repeater_settings_is_status_led_enabled,
+        .set_status_led_enabled = repeater_settings_set_status_led_enabled,
         .get_softap_auth_token = repeater_settings_get_softap_auth_token,
         .get_auto_reboot_config = repeater_settings_get_auto_reboot_config,
         .set_auto_reboot_config = repeater_settings_set_auto_reboot_config,
+        .get_failsafe_reboot_timeout_minutes =
+            repeater_settings_get_failsafe_reboot_timeout_minutes,
+        .set_failsafe_reboot_timeout_minutes =
+            repeater_settings_set_failsafe_reboot_timeout_minutes,
         .set_device_description = repeater_settings_set_device_description,
         .set_wifi_networks = bridge_set_wifi_networks,
         .set_web_auth = repeater_settings_set_web_auth,
@@ -273,4 +294,3 @@ esp_err_t repeater_web_bridge_start(repeater_runtime_t *runtime)
 
     return router_web_start(&web_context, &runtime->http_server);
 }
-

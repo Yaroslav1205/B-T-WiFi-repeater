@@ -25,6 +25,7 @@ static void storage_init(void)
 void app_main(void)
 {
     const status_led_context_t led_context = {
+        .is_enabled = repeater_settings_is_status_led_enabled,
         .is_upstream_connected = repeater_core_is_upstream_connected,
         .get_client_count = repeater_core_get_client_count,
     };

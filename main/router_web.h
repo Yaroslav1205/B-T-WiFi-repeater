@@ -19,6 +19,8 @@ typedef struct {
     bool (*is_using_backup_upstream)(void);
     const char *(*get_active_upstream_ssid)(void);
     esp_err_t (*get_upstream_ip_info)(esp_netif_ip_info_t *out_ip_info);
+    esp_err_t (*get_upstream_rssi)(int *out_rssi);
+    esp_err_t (*get_upstream_channel)(int *out_channel);
     int64_t (*get_upstream_connected_at_epoch)(void);
     esp_err_t (*get_upstream_packet_counts)(uint32_t *out_rx_packets,
                                             uint32_t *out_tx_packets);
@@ -30,15 +32,20 @@ typedef struct {
     const char *(*get_theme_label)(void);
     const char *(*get_theme_token)(void);
     esp_err_t (*set_theme_by_token)(const char *token);
+    bool (*is_status_led_enabled)(void);
+    esp_err_t (*set_status_led_enabled)(bool enabled);
     const char *(*get_softap_auth_token)(void);
     repeater_auto_reboot_config_t (*get_auto_reboot_config)(void);
     esp_err_t (*set_auto_reboot_config)(bool enabled, uint8_t hour, uint8_t minute);
+    uint8_t (*get_failsafe_reboot_timeout_minutes)(void);
+    esp_err_t (*set_failsafe_reboot_timeout_minutes)(uint8_t timeout_minutes);
     esp_err_t (*set_device_description)(const char *mac, const char *description);
     esp_err_t (*set_wifi_networks)(const char *station_ssid, const char *station_password,
                                    const char *backup_station_ssid,
                                    const char *backup_station_password,
                                    const char *softap_ssid, const char *softap_password,
-                                   const char *softap_auth_token);
+                                   const char *softap_auth_token,
+                                   bool softap_ssid_hidden);
     esp_err_t (*set_web_auth)(const char *username, const char *password);
     void (*get_firmware_status)(repeater_firmware_status_t *out_status);
     esp_err_t (*check_firmware_update)(repeater_firmware_status_t *out_status);

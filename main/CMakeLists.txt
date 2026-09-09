@@ -3,6 +3,7 @@ idf_component_register(SRCS
                     "repeater_firmware.c"
                     "reboot_scheduler.c"
                     "repeater_core.c"
+                    "repeater_dhcp_hostnames.c"
                     "repeater_web_bridge.c"
                     "repeater_settings.c"
                     "repeater_wifi.c"

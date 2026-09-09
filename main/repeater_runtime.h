@@ -31,4 +31,3 @@ typedef struct {
     temperature_sensor_handle_t temp_sensor;
     bool started;
 } repeater_runtime_t;
-

@@ -6,6 +6,8 @@ typedef struct {
     char mac[REPEATER_MAC_STRING_LEN];
     int rssi;
     char description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
+    char hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
+    char last_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
     bool is_connected;
     int64_t first_seen_epoch;
     int64_t last_seen_epoch;

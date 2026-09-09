@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <string.h>
 #include "esp_check.h"
@@ -12,9 +13,11 @@
 #define NVS_NAMESPACE    "repeater_cfg"
 #define NVS_KEY_TX_POWER "tx_power"
 #define NVS_KEY_THEME    "web_theme"
+#define NVS_KEY_STATUS_LED_EN "led_en"
 #define NVS_KEY_REBOOT_EN "reboot_en"
 #define NVS_KEY_REBOOT_H  "reboot_h"
 #define NVS_KEY_REBOOT_M  "reboot_m"
+#define NVS_KEY_FAILSAFE_REBOOT_TIMEOUT "fs_reboot_to"
 #define NVS_KEY_STA_SSID  "sta_ssid"
 #define NVS_KEY_STA_PASS  "sta_pass"
 #define NVS_KEY_STA_B_SSID "sta_b_ssid"
@@ -22,6 +25,7 @@
 #define NVS_KEY_AP_SSID   "ap_ssid"
 #define NVS_KEY_AP_PASS   "ap_pass"
 #define NVS_KEY_AP_AUTH   "ap_auth"
+#define NVS_KEY_AP_HIDDEN "ap_hidden"
 #define NVS_KEY_WEB_USER  "web_user"
 #define NVS_KEY_WEB_PASS  "web_pass"
 #define NVS_KEY_DEVICE_DESCRIPTIONS "dev_descs"
@@ -48,6 +52,21 @@ typedef struct {
     repeater_client_history_entry_t entries[REPEATER_CLIENT_HISTORY_MAX_ENTRIES];
 } repeater_client_history_store_t;
 
+static size_t repeater_client_history_store_header_size(void)
+{
+    return sizeof(repeater_client_history_store_t) - sizeof(((repeater_client_history_store_t *)0)->entries);
+}
+
+static size_t repeater_client_history_store_size_for_count(size_t count)
+{
+    if (count > REPEATER_CLIENT_HISTORY_MAX_ENTRIES) {
+        count = REPEATER_CLIENT_HISTORY_MAX_ENTRIES;
+    }
+
+    return repeater_client_history_store_header_size() +
+        count * sizeof(((repeater_client_history_store_t *)0)->entries[0]);
+}
+
 static const repeater_signal_level_t s_signal_levels[] = {
     { "low", "Low (5 dBm)", 20 },
     { "medium", "Medium (10 dBm)", 40 },
@@ -64,15 +83,20 @@ static const repeater_softap_auth_option_t s_softap_auth_options[] = {
     { "open", "Open", WIFI_AUTH_OPEN },
     { "wpa2", "WPA2-PSK", WIFI_AUTH_WPA2_PSK },
     { "mixed", "WPA/WPA2-PSK", WIFI_AUTH_WPA_WPA2_PSK },
+    { "wpa3", "WPA3-PSK", WIFI_AUTH_WPA3_PSK },
+    { "wpa2_wpa3", "WPA2/WPA3-PSK", WIFI_AUTH_WPA2_WPA3_PSK },
 };
 
 static int8_t s_tx_power_quarter_dbm = PROJECT_DEFAULT_TX_POWER_QUARTER_DBM;
 static char s_theme_token[THEME_TOKEN_MAX_LEN] = PROJECT_DEFAULT_WEB_THEME;
+static atomic_bool s_status_led_enabled = true;
 static repeater_auto_reboot_config_t s_auto_reboot_config = {
     .enabled = PROJECT_DEFAULT_AUTO_REBOOT_ENABLED,
     .hour = PROJECT_DEFAULT_AUTO_REBOOT_HOUR,
     .minute = PROJECT_DEFAULT_AUTO_REBOOT_MINUTE,
 };
+static uint8_t s_failsafe_reboot_timeout_minutes =
+    PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
 static repeater_station_config_t s_station_config;
 static repeater_station_config_t s_backup_station_config;
 static repeater_softap_config_t s_softap_config;
@@ -305,6 +329,11 @@ static void set_default_auto_reboot_config(void)
     s_auto_reboot_config.minute = PROJECT_DEFAULT_AUTO_REBOOT_MINUTE;
 }
 
+static void set_default_failsafe_reboot_timeout_minutes(void)
+{
+    s_failsafe_reboot_timeout_minutes = PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
+}
+
 static void set_default_station_config(void)
 {
     copy_text(PROJECT_WIFI_STA_SSID, s_station_config.ssid, sizeof(s_station_config.ssid));
@@ -324,6 +353,7 @@ static void set_default_softap_config(void)
     copy_text(PROJECT_WIFI_AP_SSID, s_softap_config.ssid, sizeof(s_softap_config.ssid));
     copy_text(PROJECT_WIFI_AP_PASSWORD, s_softap_config.password, sizeof(s_softap_config.password));
     s_softap_config.auth_mode = PROJECT_WIFI_AP_AUTH_MODE;
+    s_softap_config.ssid_hidden = PROJECT_WIFI_AP_SSID_HIDDEN;
 }
 
 static void set_default_web_auth_config(void)
@@ -338,7 +368,9 @@ static void set_runtime_defaults(bool preserve_client_history)
 {
     s_tx_power_quarter_dbm = PROJECT_DEFAULT_TX_POWER_QUARTER_DBM;
     set_default_theme_token();
+    atomic_store(&s_status_led_enabled, true);
     set_default_auto_reboot_config();
+    set_default_failsafe_reboot_timeout_minutes();
     set_default_station_config();
     set_default_backup_station_config();
     set_default_softap_config();
@@ -361,6 +393,8 @@ static esp_err_t load_client_history_from_store(const repeater_client_history_st
     for (size_t i = 0; i < store->count; ++i) {
         char normalized_mac[REPEATER_MAC_STRING_LEN];
         char trimmed_description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
+        char trimmed_hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
+        char trimmed_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
         repeater_client_history_entry_t *entry;
         int64_t first_seen = store->entries[i].first_seen_epoch;
         int64_t last_seen = store->entries[i].last_seen_epoch;
@@ -370,6 +404,8 @@ static esp_err_t load_client_history_from_store(const repeater_client_history_st
         }
 
         trim_text_copy(store->entries[i].description, trimmed_description, sizeof(trimmed_description));
+        trim_text_copy(store->entries[i].hostname, trimmed_hostname, sizeof(trimmed_hostname));
+        trim_text_copy(store->entries[i].last_local_ip, trimmed_local_ip, sizeof(trimmed_local_ip));
         if (first_seen < MIN_VALID_UNIX_TIMESTAMP) {
             first_seen = 0;
         }
@@ -389,6 +425,8 @@ static esp_err_t load_client_history_from_store(const repeater_client_history_st
         }
 
         snprintf(entry->description, sizeof(entry->description), "%s", trimmed_description);
+        snprintf(entry->hostname, sizeof(entry->hostname), "%s", trimmed_hostname);
+        snprintf(entry->last_local_ip, sizeof(entry->last_local_ip), "%s", trimmed_local_ip);
         entry->first_seen_epoch = first_seen;
         entry->last_seen_epoch = last_seen;
     }
@@ -435,36 +473,30 @@ static bool is_valid_auto_reboot_time(uint8_t hour, uint8_t minute)
     return hour < 24 && minute < 60;
 }
 
+static bool is_valid_failsafe_reboot_timeout_minutes(uint8_t timeout_minutes)
+{
+    return timeout_minutes == 0 || timeout_minutes <= PROJECT_FAILSAFE_REBOOT_MAX_TIMEOUT_MINUTES;
+}
+
 static bool is_valid_wifi_ssid(const char *ssid)
 {
-    size_t length = ssid != NULL ? strlen(ssid) : 0;
-    return length > 0 && length <= REPEATER_WIFI_SSID_MAX_LEN;
+    return ssid != NULL;
 }
 
 static bool is_valid_wifi_password(const char *password)
 {
-    size_t length = password != NULL ? strlen(password) : 0;
-    return length == 0 || (length >= 8 && length <= REPEATER_WIFI_PASSWORD_MAX_LEN);
+    return password != NULL;
 }
 
 static bool is_valid_optional_wifi_config(const char *ssid, const char *password)
 {
-    size_t ssid_length = ssid != NULL ? strlen(ssid) : 0;
-
-    if (ssid_length == 0) {
-        return password == NULL || password[0] == '\0';
-    }
-
-    return is_valid_wifi_ssid(ssid) && is_valid_wifi_password(password);
+    return ssid != NULL && password != NULL;
 }
 
 static bool is_valid_softap_auth_password(wifi_auth_mode_t auth_mode, const char *password)
 {
-    if (auth_mode == WIFI_AUTH_OPEN) {
-        return password != NULL;
-    }
-
-    return is_valid_wifi_password(password) && password != NULL && password[0] != '\0';
+    (void)auth_mode;
+    return password != NULL;
 }
 
 static bool is_valid_web_auth_username(const char *username)
@@ -479,9 +511,22 @@ static bool is_valid_web_auth_password(const char *password)
     return length > 0 && length <= REPEATER_WEB_AUTH_PASSWORD_MAX_LEN;
 }
 
+static bool is_valid_client_hostname(const char *hostname)
+{
+    size_t length = hostname != NULL ? strlen(hostname) : 0;
+    return length <= REPEATER_CLIENT_HOSTNAME_MAX_LEN;
+}
+
+static bool is_valid_client_local_ip(const char *local_ip)
+{
+    size_t length = local_ip != NULL ? strlen(local_ip) : 0;
+    return length <= REPEATER_CLIENT_LOCAL_IP_MAX_LEN;
+}
+
 static esp_err_t save_client_history_to_nvs(nvs_handle_t nvs_handle)
 {
-    repeater_client_history_store_t *store = calloc(1, sizeof(*store));
+    const size_t store_size = repeater_client_history_store_size_for_count(s_client_history_count);
+    repeater_client_history_store_t *store = calloc(1, store_size);
     esp_err_t err;
 
     ESP_RETURN_ON_FALSE(store != NULL, ESP_ERR_NO_MEM, TAG,
@@ -494,7 +539,7 @@ static esp_err_t save_client_history_to_nvs(nvs_handle_t nvs_handle)
         store->entries[i] = s_client_history[i];
     }
 
-    err = nvs_set_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, store, sizeof(*store));
+    err = nvs_set_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, store, store_size);
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
     }
@@ -545,6 +590,18 @@ static esp_err_t save_auto_reboot_to_nvs(nvs_handle_t nvs_handle, bool enabled,
     return ESP_OK;
 }
 
+static esp_err_t save_failsafe_reboot_timeout_to_nvs(nvs_handle_t nvs_handle,
+                                                     uint8_t timeout_minutes)
+{
+    esp_err_t err = nvs_set_u8(nvs_handle, NVS_KEY_FAILSAFE_REBOOT_TIMEOUT, timeout_minutes);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to save failsafe reboot timeout to NVS");
+    return ESP_OK;
+}
+
 static esp_err_t save_wifi_networks_to_nvs(nvs_handle_t nvs_handle,
                                            const repeater_station_config_t *station_config,
                                            const repeater_station_config_t *backup_station_config,
@@ -569,6 +626,9 @@ static esp_err_t save_wifi_networks_to_nvs(nvs_handle_t nvs_handle,
     }
     if (err == ESP_OK) {
         err = nvs_set_u8(nvs_handle, NVS_KEY_AP_AUTH, (uint8_t)softap_config->auth_mode);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs_handle, NVS_KEY_AP_HIDDEN, softap_config->ssid_hidden ? 1 : 0);
     }
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
@@ -613,6 +673,7 @@ esp_err_t repeater_settings_init(void)
     uint8_t reboot_enabled = PROJECT_DEFAULT_AUTO_REBOOT_ENABLED ? 1 : 0;
     uint8_t reboot_hour = PROJECT_DEFAULT_AUTO_REBOOT_HOUR;
     uint8_t reboot_minute = PROJECT_DEFAULT_AUTO_REBOOT_MINUTE;
+    uint8_t failsafe_reboot_timeout_minutes = PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
 
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -624,6 +685,8 @@ esp_err_t repeater_settings_init(void)
         ESP_LOGI(TAG, "No saved auto reboot config in NVS, using default: %s at %02u:%02u",
                  s_auto_reboot_config.enabled ? "enabled" : "disabled",
                  s_auto_reboot_config.hour, s_auto_reboot_config.minute);
+        ESP_LOGI(TAG, "No saved failsafe reboot timeout in NVS, using default: %u minute(s)",
+                 (unsigned int)s_failsafe_reboot_timeout_minutes);
         ESP_LOGI(TAG, "No saved station config in NVS, using default SSID: %s",
                  s_station_config.ssid);
         ESP_LOGI(TAG, "No saved backup station config in NVS, using default SSID: %s",
@@ -675,6 +738,14 @@ esp_err_t repeater_settings_init(void)
         }
     }
 
+    uint8_t status_led_enabled = 1;
+    err = nvs_get_u8(nvs_handle, NVS_KEY_STATUS_LED_EN, &status_led_enabled);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(nvs_handle);
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to read status LED setting from NVS");
+    }
+    atomic_store(&s_status_led_enabled, status_led_enabled <= 1 ? status_led_enabled != 0 : true);
+
     err = nvs_get_u8(nvs_handle, NVS_KEY_REBOOT_EN, &reboot_enabled);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         set_default_auto_reboot_config();
@@ -715,13 +786,33 @@ esp_err_t repeater_settings_init(void)
         }
     }
 
+    err = nvs_get_u8(nvs_handle, NVS_KEY_FAILSAFE_REBOOT_TIMEOUT, &failsafe_reboot_timeout_minutes);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        set_default_failsafe_reboot_timeout_minutes();
+        ESP_LOGI(TAG, "Failsafe reboot timeout key not found in NVS, using default: %u minute(s)",
+                 (unsigned int)s_failsafe_reboot_timeout_minutes);
+    } else if (err != ESP_OK) {
+        nvs_close(nvs_handle);
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to read failsafe reboot timeout from NVS");
+    } else if (!is_valid_failsafe_reboot_timeout_minutes(failsafe_reboot_timeout_minutes)) {
+        set_default_failsafe_reboot_timeout_minutes();
+        ESP_LOGW(TAG, "Invalid saved failsafe reboot timeout, using default: %u minute(s)",
+                 (unsigned int)s_failsafe_reboot_timeout_minutes);
+    } else {
+        s_failsafe_reboot_timeout_minutes = failsafe_reboot_timeout_minutes;
+        ESP_LOGI(TAG, "Loaded failsafe reboot timeout from NVS: %u minute(s)%s",
+                 (unsigned int)s_failsafe_reboot_timeout_minutes,
+                 s_failsafe_reboot_timeout_minutes == 0 ? " (disabled)" : "");
+    }
+
     size_t station_ssid_len = sizeof(s_station_config.ssid);
     err = nvs_get_str(nvs_handle, NVS_KEY_STA_SSID, s_station_config.ssid, &station_ssid_len);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         set_default_station_config();
         ESP_LOGI(TAG, "Station SSID key not found in NVS, using default: %s",
                  s_station_config.ssid);
-    } else if (err != ESP_OK || !is_valid_wifi_ssid(s_station_config.ssid)) {
+    } else if (err != ESP_OK || (s_station_config.ssid[0] != '\0' &&
+                                 !is_valid_wifi_ssid(s_station_config.ssid))) {
         set_default_station_config();
         ESP_LOGW(TAG, "Invalid saved station SSID, using default: %s",
                  s_station_config.ssid);
@@ -730,10 +821,11 @@ esp_err_t repeater_settings_init(void)
         err = nvs_get_str(nvs_handle, NVS_KEY_STA_PASS, s_station_config.password,
                           &station_password_len);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
-            copy_text(PROJECT_WIFI_STA_PASSWORD, s_station_config.password,
-                      sizeof(s_station_config.password));
-            ESP_LOGI(TAG, "Station password key not found in NVS, using default password");
-        } else if (err != ESP_OK || !is_valid_wifi_password(s_station_config.password)) {
+            s_station_config.password[0] = '\0';
+            ESP_LOGI(TAG, "Station password key not found in NVS, using empty password");
+        } else if (err != ESP_OK ||
+                   !is_valid_optional_wifi_config(s_station_config.ssid,
+                                                  s_station_config.password)) {
             set_default_station_config();
             ESP_LOGW(TAG, "Invalid saved station password, using default credentials");
         } else {
@@ -758,9 +850,8 @@ esp_err_t repeater_settings_init(void)
         err = nvs_get_str(nvs_handle, NVS_KEY_STA_B_PASS, s_backup_station_config.password,
                           &backup_station_password_len);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
-            copy_text(PROJECT_WIFI_STA_BACKUP_PASSWORD, s_backup_station_config.password,
-                      sizeof(s_backup_station_config.password));
-            ESP_LOGI(TAG, "Backup station password key not found in NVS, using default password");
+            s_backup_station_config.password[0] = '\0';
+            ESP_LOGI(TAG, "Backup station password key not found in NVS, using empty password");
         } else if (err != ESP_OK ||
                    !is_valid_optional_wifi_config(s_backup_station_config.ssid,
                                                   s_backup_station_config.password)) {
@@ -778,7 +869,8 @@ esp_err_t repeater_settings_init(void)
         set_default_softap_config();
         ESP_LOGI(TAG, "SoftAP SSID key not found in NVS, using default: %s",
                  s_softap_config.ssid);
-    } else if (err != ESP_OK || !is_valid_wifi_ssid(s_softap_config.ssid)) {
+    } else if (err != ESP_OK || (s_softap_config.ssid[0] != '\0' &&
+                                 !is_valid_wifi_ssid(s_softap_config.ssid))) {
         set_default_softap_config();
         ESP_LOGW(TAG, "Invalid saved SoftAP SSID, using default: %s",
                  s_softap_config.ssid);
@@ -787,30 +879,56 @@ esp_err_t repeater_settings_init(void)
         err = nvs_get_str(nvs_handle, NVS_KEY_AP_PASS, s_softap_config.password,
                           &softap_password_len);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
-            copy_text(PROJECT_WIFI_AP_PASSWORD, s_softap_config.password,
-                      sizeof(s_softap_config.password));
-            ESP_LOGI(TAG, "SoftAP password key not found in NVS, using default password");
-        } else if (err != ESP_OK || !is_valid_wifi_password(s_softap_config.password)) {
+            s_softap_config.password[0] = '\0';
+            ESP_LOGI(TAG, "SoftAP password key not found in NVS, using empty password");
+        } else if (err != ESP_OK ||
+                   !is_valid_optional_wifi_config(s_softap_config.ssid,
+                                                  s_softap_config.password)) {
             set_default_softap_config();
             ESP_LOGW(TAG, "Invalid saved SoftAP password, using default credentials");
         } else {
             uint8_t softap_auth_mode = (uint8_t)PROJECT_WIFI_AP_AUTH_MODE;
             err = nvs_get_u8(nvs_handle, NVS_KEY_AP_AUTH, &softap_auth_mode);
             if (err == ESP_ERR_NVS_NOT_FOUND) {
-                s_softap_config.auth_mode = PROJECT_WIFI_AP_AUTH_MODE;
-                ESP_LOGI(TAG, "SoftAP auth key not found in NVS, using default mode");
+                s_softap_config.auth_mode = s_softap_config.ssid[0] == '\0'
+                    ? WIFI_AUTH_OPEN
+                    : PROJECT_WIFI_AP_AUTH_MODE;
+                ESP_LOGI(TAG, "SoftAP auth key not found in NVS, using %s mode",
+                         s_softap_config.ssid[0] == '\0' ? "open" : "default");
             } else if (err != ESP_OK ||
-                       find_softap_auth_option_by_mode((wifi_auth_mode_t)softap_auth_mode) == NULL ||
-                       !is_valid_softap_auth_password((wifi_auth_mode_t)softap_auth_mode,
-                                                      s_softap_config.password)) {
+                       (s_softap_config.ssid[0] != '\0' &&
+                        (find_softap_auth_option_by_mode((wifi_auth_mode_t)softap_auth_mode) == NULL ||
+                         !is_valid_softap_auth_password((wifi_auth_mode_t)softap_auth_mode,
+                                                        s_softap_config.password)))) {
                 set_default_softap_config();
                 ESP_LOGW(TAG, "Invalid saved SoftAP auth mode, using default credentials");
             } else {
-                s_softap_config.auth_mode = (wifi_auth_mode_t)softap_auth_mode;
+                s_softap_config.auth_mode = s_softap_config.ssid[0] == '\0'
+                    ? WIFI_AUTH_OPEN
+                    : (wifi_auth_mode_t)softap_auth_mode;
                 ESP_LOGI(TAG, "Loaded SoftAP config from NVS: SSID=%s mode=%s",
-                         s_softap_config.ssid, repeater_settings_get_softap_auth_label());
+                         s_softap_config.ssid,
+                         s_softap_config.ssid[0] == '\0'
+                             ? "Open (disabled SSID)"
+                             : repeater_settings_get_softap_auth_label());
             }
         }
+    }
+
+    uint8_t softap_ssid_hidden = PROJECT_WIFI_AP_SSID_HIDDEN ? 1 : 0;
+    err = nvs_get_u8(nvs_handle, NVS_KEY_AP_HIDDEN, &softap_ssid_hidden);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        s_softap_config.ssid_hidden = PROJECT_WIFI_AP_SSID_HIDDEN;
+        ESP_LOGI(TAG, "SoftAP hidden SSID key not found in NVS, using default: %s",
+                 s_softap_config.ssid_hidden ? "hidden" : "visible");
+    } else if (err != ESP_OK || softap_ssid_hidden > 1) {
+        s_softap_config.ssid_hidden = PROJECT_WIFI_AP_SSID_HIDDEN;
+        ESP_LOGW(TAG, "Invalid saved SoftAP hidden SSID setting, using default: %s",
+                 s_softap_config.ssid_hidden ? "hidden" : "visible");
+    } else {
+        s_softap_config.ssid_hidden = softap_ssid_hidden != 0;
+        ESP_LOGI(TAG, "Loaded SoftAP SSID visibility from NVS: %s",
+                 s_softap_config.ssid_hidden ? "hidden" : "visible");
     }
 
     size_t web_username_len = sizeof(s_web_auth_config.username);
@@ -840,21 +958,18 @@ esp_err_t repeater_settings_init(void)
     }
 
     {
-        repeater_client_history_store_t *client_history_store = calloc(1, sizeof(*client_history_store));
+        repeater_client_history_store_t *client_history_store = NULL;
         repeater_device_description_store_t *legacy_device_store = calloc(1, sizeof(*legacy_device_store));
-        size_t client_history_store_size = sizeof(*client_history_store);
+        size_t client_history_store_size = 0;
         size_t legacy_device_store_size = sizeof(*legacy_device_store);
 
-        if (client_history_store == NULL || legacy_device_store == NULL) {
-            free(client_history_store);
-            free(legacy_device_store);
+        if (legacy_device_store == NULL) {
             nvs_close(nvs_handle);
             ESP_LOGE(TAG, "Failed to allocate client history load buffers");
             return ESP_ERR_NO_MEM;
         }
 
-        err = nvs_get_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, client_history_store,
-                           &client_history_store_size);
+        err = nvs_get_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, NULL, &client_history_store_size);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
             err = nvs_get_blob(nvs_handle, NVS_KEY_DEVICE_DESCRIPTIONS, legacy_device_store,
                                &legacy_device_store_size);
@@ -871,22 +986,52 @@ esp_err_t repeater_settings_init(void)
                              (unsigned int)s_client_history_count);
                 }
             } else {
-                free(client_history_store);
                 free(legacy_device_store);
                 nvs_close(nvs_handle);
                 ESP_RETURN_ON_ERROR(err, TAG, "Failed to read legacy device descriptions from NVS");
             }
         } else if (err == ESP_OK) {
-            if (client_history_store_size != sizeof(*client_history_store) ||
-                load_client_history_from_store(client_history_store) != ESP_OK) {
+            const size_t min_store_size = repeater_client_history_store_header_size();
+            const size_t max_store_size =
+                repeater_client_history_store_size_for_count(REPEATER_CLIENT_HISTORY_MAX_ENTRIES);
+
+            if (client_history_store_size < min_store_size || client_history_store_size > max_store_size) {
                 clear_client_history();
-                ESP_LOGW(TAG, "Invalid saved client history, ignoring stored data");
+                ESP_LOGW(TAG, "Saved client history has invalid size %u, ignoring stored data",
+                         (unsigned int)client_history_store_size);
             } else {
-                ESP_LOGI(TAG, "Loaded %u saved client history records from NVS",
-                         (unsigned int)s_client_history_count);
+                client_history_store = calloc(1, client_history_store_size);
+                if (client_history_store == NULL) {
+                    free(legacy_device_store);
+                    nvs_close(nvs_handle);
+                    ESP_LOGE(TAG, "Failed to allocate client history blob buffer");
+                    return ESP_ERR_NO_MEM;
+                }
+
+                err = nvs_get_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, client_history_store,
+                                   &client_history_store_size);
+                if (err != ESP_OK) {
+                    free(client_history_store);
+                    free(legacy_device_store);
+                    nvs_close(nvs_handle);
+                    ESP_RETURN_ON_ERROR(err, TAG, "Failed to read client history from NVS");
+                }
+
+                if (client_history_store->count > REPEATER_CLIENT_HISTORY_MAX_ENTRIES ||
+                    client_history_store_size !=
+                        repeater_client_history_store_size_for_count(client_history_store->count) ||
+                    load_client_history_from_store(client_history_store) != ESP_OK) {
+                    clear_client_history();
+                    ESP_LOGW(TAG, "Invalid saved client history, ignoring stored data");
+                } else {
+                    ESP_LOGI(TAG, "Loaded %u saved client history records from NVS",
+                             (unsigned int)s_client_history_count);
+                }
             }
+        } else if (err == ESP_ERR_NVS_INVALID_LENGTH) {
+            clear_client_history();
+            ESP_LOGW(TAG, "Saved client history uses an older layout, ignoring stored data");
         } else {
-            free(client_history_store);
             free(legacy_device_store);
             nvs_close(nvs_handle);
             ESP_RETURN_ON_ERROR(err, TAG, "Failed to read client history from NVS");
@@ -904,13 +1049,14 @@ esp_err_t repeater_settings_factory_reset(void)
 {
     nvs_handle_t nvs_handle;
 
-    set_runtime_defaults(true);
-
     ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
                         "Failed to open NVS for factory reset");
     esp_err_t err = erase_key_if_present(nvs_handle, NVS_KEY_TX_POWER);
     if (err == ESP_OK) {
         err = erase_key_if_present(nvs_handle, NVS_KEY_THEME);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_STATUS_LED_EN);
     }
     if (err == ESP_OK) {
         err = erase_key_if_present(nvs_handle, NVS_KEY_REBOOT_EN);
@@ -920,6 +1066,9 @@ esp_err_t repeater_settings_factory_reset(void)
     }
     if (err == ESP_OK) {
         err = erase_key_if_present(nvs_handle, NVS_KEY_REBOOT_M);
+    }
+    if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_FAILSAFE_REBOOT_TIMEOUT);
     }
     if (err == ESP_OK) {
         err = erase_key_if_present(nvs_handle, NVS_KEY_STA_SSID);
@@ -943,6 +1092,9 @@ esp_err_t repeater_settings_factory_reset(void)
         err = erase_key_if_present(nvs_handle, NVS_KEY_AP_AUTH);
     }
     if (err == ESP_OK) {
+        err = erase_key_if_present(nvs_handle, NVS_KEY_AP_HIDDEN);
+    }
+    if (err == ESP_OK) {
         err = erase_key_if_present(nvs_handle, NVS_KEY_WEB_USER);
     }
     if (err == ESP_OK) {
@@ -954,7 +1106,10 @@ esp_err_t repeater_settings_factory_reset(void)
     nvs_close(nvs_handle);
     ESP_RETURN_ON_ERROR(err, TAG, "Failed to erase saved settings");
 
-    ESP_LOGW(TAG, "Factory reset completed; saved settings restored to defaults while keeping client history");
+    set_runtime_defaults(true);
+    ESP_LOGW(TAG, "Factory reset completed; SSID visibility=%s, status LED=%s; client history kept",
+             s_softap_config.ssid_hidden ? "hidden" : "visible",
+             repeater_settings_is_status_led_enabled() ? "enabled" : "disabled");
     return ESP_OK;
 }
 
@@ -1010,6 +1165,29 @@ esp_err_t repeater_settings_set_theme_by_token(const char *token)
     return ESP_OK;
 }
 
+bool repeater_settings_is_status_led_enabled(void)
+{
+    return PROJECT_STATUS_LED_ENABLED && atomic_load(&s_status_led_enabled);
+}
+
+esp_err_t repeater_settings_set_status_led_enabled(bool enabled)
+{
+    nvs_handle_t nvs_handle;
+
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
+                        "Failed to open NVS for status LED write");
+    esp_err_t err = nvs_set_u8(nvs_handle, NVS_KEY_STATUS_LED_EN, enabled ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+    nvs_close(nvs_handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to persist status LED setting");
+
+    atomic_store(&s_status_led_enabled, enabled);
+    ESP_LOGI(TAG, "Saved status LED: %s", enabled ? "enabled" : "disabled");
+    return ESP_OK;
+}
+
 esp_err_t repeater_settings_set_auto_reboot_config(bool enabled, uint8_t hour, uint8_t minute)
 {
     nvs_handle_t nvs_handle;
@@ -1031,6 +1209,30 @@ esp_err_t repeater_settings_set_auto_reboot_config(bool enabled, uint8_t hour, u
 
     ESP_LOGI(TAG, "Saved auto reboot config: %s at %02u:%02u",
              enabled ? "enabled" : "disabled", hour, minute);
+    return ESP_OK;
+}
+
+esp_err_t repeater_settings_set_failsafe_reboot_timeout_minutes(uint8_t timeout_minutes)
+{
+    nvs_handle_t nvs_handle;
+
+    if (!is_valid_failsafe_reboot_timeout_minutes(timeout_minutes)) {
+        ESP_LOGE(TAG, "Invalid failsafe reboot timeout: %u minute(s)",
+                 (unsigned int)timeout_minutes);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_failsafe_reboot_timeout_minutes = timeout_minutes;
+
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
+                        "Failed to open NVS for failsafe reboot timeout write");
+    esp_err_t err = save_failsafe_reboot_timeout_to_nvs(nvs_handle, timeout_minutes);
+    nvs_close(nvs_handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to persist failsafe reboot timeout");
+
+    ESP_LOGI(TAG, "Saved failsafe reboot timeout: %u minute(s)%s",
+             (unsigned int)timeout_minutes,
+             timeout_minutes == 0 ? " (disabled)" : "");
     return ESP_OK;
 }
 
@@ -1070,6 +1272,80 @@ esp_err_t repeater_settings_record_client_connection(const char *mac)
     return ESP_OK;
 }
 
+esp_err_t repeater_settings_set_client_hostname(const char *mac, const char *hostname)
+{
+    nvs_handle_t nvs_handle;
+    char normalized_mac[REPEATER_MAC_STRING_LEN];
+    char trimmed_hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
+    repeater_client_history_entry_t *entry;
+
+    if (!normalize_mac_address(mac, normalized_mac, sizeof(normalized_mac))) {
+        ESP_LOGE(TAG, "Invalid MAC for hostname: %s", mac != NULL ? mac : "(null)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    trim_text_copy(hostname, trimmed_hostname, sizeof(trimmed_hostname));
+    if (!is_valid_client_hostname(trimmed_hostname)) {
+        ESP_LOGE(TAG, "Invalid hostname text for MAC %s", normalized_mac);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    entry = ensure_client_history_entry(normalized_mac);
+    if (entry == NULL) {
+        ESP_LOGE(TAG, "Client history limit reached (%d)", REPEATER_CLIENT_HISTORY_MAX_ENTRIES);
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(entry->hostname, sizeof(entry->hostname), "%s", trimmed_hostname);
+
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
+                        "Failed to open NVS for client hostname write");
+    esp_err_t err = save_client_history_to_nvs(nvs_handle);
+    nvs_close(nvs_handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to persist client hostname");
+
+    ESP_LOGI(TAG, "Saved client hostname for MAC %s: %s",
+             normalized_mac, trimmed_hostname[0] != '\0' ? trimmed_hostname : "(cleared)");
+    return ESP_OK;
+}
+
+esp_err_t repeater_settings_set_client_last_local_ip(const char *mac, const char *local_ip)
+{
+    nvs_handle_t nvs_handle;
+    char normalized_mac[REPEATER_MAC_STRING_LEN];
+    char trimmed_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
+    repeater_client_history_entry_t *entry;
+
+    if (!normalize_mac_address(mac, normalized_mac, sizeof(normalized_mac))) {
+        ESP_LOGE(TAG, "Invalid MAC for local IP: %s", mac != NULL ? mac : "(null)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    trim_text_copy(local_ip, trimmed_local_ip, sizeof(trimmed_local_ip));
+    if (!is_valid_client_local_ip(trimmed_local_ip)) {
+        ESP_LOGE(TAG, "Invalid local IP text for MAC %s", normalized_mac);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    entry = ensure_client_history_entry(normalized_mac);
+    if (entry == NULL) {
+        ESP_LOGE(TAG, "Client history limit reached (%d)", REPEATER_CLIENT_HISTORY_MAX_ENTRIES);
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(entry->last_local_ip, sizeof(entry->last_local_ip), "%s", trimmed_local_ip);
+
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG,
+                        "Failed to open NVS for client local IP write");
+    esp_err_t err = save_client_history_to_nvs(nvs_handle);
+    nvs_close(nvs_handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to persist client local IP");
+
+    ESP_LOGI(TAG, "Saved client local IP for MAC %s: %s",
+             normalized_mac, trimmed_local_ip[0] != '\0' ? trimmed_local_ip : "(cleared)");
+    return ESP_OK;
+}
+
 esp_err_t repeater_settings_set_device_description(const char *mac, const char *description)
 {
     nvs_handle_t nvs_handle;
@@ -1093,6 +1369,8 @@ esp_err_t repeater_settings_set_device_description(const char *mac, const char *
     snprintf(entry->description, sizeof(entry->description), "%s", trimmed_description);
 
     if (trimmed_description[0] == '\0' &&
+        entry->hostname[0] == '\0' &&
+        entry->last_local_ip[0] == '\0' &&
         entry->first_seen_epoch == 0 &&
         entry->last_seen_epoch == 0) {
         int index = find_client_history_index(normalized_mac);
@@ -1123,7 +1401,8 @@ esp_err_t repeater_settings_set_wifi_networks(const char *station_ssid,
                                               const char *backup_station_password,
                                               const char *softap_ssid,
                                               const char *softap_password,
-                                              const char *softap_auth_token)
+                                              const char *softap_auth_token,
+                                              bool softap_ssid_hidden)
 {
     nvs_handle_t nvs_handle;
     repeater_station_config_t new_station_config;
@@ -1133,25 +1412,33 @@ esp_err_t repeater_settings_set_wifi_networks(const char *station_ssid,
     const repeater_station_config_t old_backup_station_config = s_backup_station_config;
     const repeater_softap_config_t old_softap_config = s_softap_config;
     const repeater_softap_auth_option_t *softap_auth_option =
-        find_softap_auth_option_by_token(softap_auth_token);
+        find_softap_auth_option_by_token(softap_auth_token != NULL ? softap_auth_token : "");
+    const char *resolved_station_ssid = station_ssid != NULL ? station_ssid : "";
+    const char *resolved_station_password = station_password != NULL ? station_password : "";
+    const char *resolved_backup_station_ssid =
+        backup_station_ssid != NULL ? backup_station_ssid : "";
+    const char *resolved_backup_station_password =
+        backup_station_password != NULL ? backup_station_password : "";
+    const char *resolved_softap_ssid = softap_ssid != NULL ? softap_ssid : "";
+    const char *resolved_softap_password = softap_password != NULL ? softap_password : "";
+    wifi_auth_mode_t resolved_softap_auth_mode = PROJECT_WIFI_AP_AUTH_MODE;
 
-    if (!is_valid_wifi_ssid(station_ssid) || !is_valid_wifi_password(station_password) ||
-        !is_valid_optional_wifi_config(backup_station_ssid, backup_station_password) ||
-        !is_valid_wifi_ssid(softap_ssid) || softap_auth_option == NULL ||
-        !is_valid_softap_auth_password(softap_auth_option->auth_mode, softap_password)) {
-        ESP_LOGE(TAG, "Invalid Station/SoftAP parameters received");
-        return ESP_ERR_INVALID_ARG;
+    if (resolved_softap_ssid[0] == '\0' || resolved_softap_password[0] == '\0') {
+        resolved_softap_auth_mode = WIFI_AUTH_OPEN;
+    } else if (softap_auth_option != NULL) {
+        resolved_softap_auth_mode = softap_auth_option->auth_mode;
     }
 
-    copy_text(station_ssid, new_station_config.ssid, sizeof(new_station_config.ssid));
-    copy_text(station_password, new_station_config.password, sizeof(new_station_config.password));
-    copy_text(backup_station_ssid, new_backup_station_config.ssid,
+    copy_text(resolved_station_ssid, new_station_config.ssid, sizeof(new_station_config.ssid));
+    copy_text(resolved_station_password, new_station_config.password, sizeof(new_station_config.password));
+    copy_text(resolved_backup_station_ssid, new_backup_station_config.ssid,
               sizeof(new_backup_station_config.ssid));
-    copy_text(backup_station_password, new_backup_station_config.password,
+    copy_text(resolved_backup_station_password, new_backup_station_config.password,
               sizeof(new_backup_station_config.password));
-    copy_text(softap_ssid, new_softap_config.ssid, sizeof(new_softap_config.ssid));
-    copy_text(softap_password, new_softap_config.password, sizeof(new_softap_config.password));
-    new_softap_config.auth_mode = softap_auth_option->auth_mode;
+    copy_text(resolved_softap_ssid, new_softap_config.ssid, sizeof(new_softap_config.ssid));
+    copy_text(resolved_softap_password, new_softap_config.password, sizeof(new_softap_config.password));
+    new_softap_config.auth_mode = resolved_softap_auth_mode;
+    new_softap_config.ssid_hidden = softap_ssid_hidden;
 
     s_station_config = new_station_config;
     s_backup_station_config = new_backup_station_config;
@@ -1170,10 +1457,14 @@ esp_err_t repeater_settings_set_wifi_networks(const char *station_ssid,
         ESP_RETURN_ON_ERROR(err, TAG, "Failed to persist Wi-Fi network settings");
     }
 
-    ESP_LOGI(TAG, "Saved uplink and SoftAP settings: primary=%s backup=%s softap=%s mode=%s",
+    ESP_LOGI(TAG, "Saved uplink and SoftAP settings: primary=%s backup=%s softap=%s mode=%s visibility=%s",
              s_station_config.ssid,
              s_backup_station_config.ssid[0] != '\0' ? s_backup_station_config.ssid : "(disabled)",
-             s_softap_config.ssid, repeater_settings_get_softap_auth_label());
+             s_softap_config.ssid,
+             s_softap_config.auth_mode == WIFI_AUTH_OPEN
+                 ? "open"
+                 : repeater_settings_get_softap_auth_label(),
+             s_softap_config.ssid_hidden ? "hidden" : "visible");
     return ESP_OK;
 }
 
@@ -1281,6 +1572,11 @@ bool repeater_settings_is_auto_reboot_enabled(void)
 repeater_auto_reboot_config_t repeater_settings_get_auto_reboot_config(void)
 {
     return s_auto_reboot_config;
+}
+
+uint8_t repeater_settings_get_failsafe_reboot_timeout_minutes(void)
+{
+    return s_failsafe_reboot_timeout_minutes;
 }
 
 size_t repeater_settings_get_client_history(repeater_client_history_entry_t *entries, size_t max_entries)

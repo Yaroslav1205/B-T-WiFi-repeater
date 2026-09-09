@@ -15,23 +15,44 @@ static const int STATUS_LED_STARTUP_BLINK_COUNT = 10;
 
 static void status_led_set(bool on)
 {
+    on = on && s_context.is_enabled();
     gpio_set_level(PROJECT_STATUS_LED_GPIO,
                    on ? PROJECT_STATUS_LED_ACTIVE_LEVEL : !PROJECT_STATUS_LED_ACTIVE_LEVEL);
+}
+
+/* Poll during long pauses so disabling the LED takes effect within 50 ms. */
+static void status_led_delay(TickType_t ticks)
+{
+    const TickType_t poll_ticks = pdMS_TO_TICKS(50) > 0 ? pdMS_TO_TICKS(50) : 1;
+    while (ticks > 0) {
+        const TickType_t step = ticks < poll_ticks ? ticks : poll_ticks;
+        vTaskDelay(step);
+        ticks -= step;
+        if (!s_context.is_enabled()) {
+            status_led_set(false);
+        }
+    }
 }
 
 static void status_led_run_startup_pattern(void)
 {
     for (int i = 0; i < STATUS_LED_STARTUP_BLINK_COUNT; ++i) {
         status_led_set(true);
-        vTaskDelay(STATUS_LED_STARTUP_BLINK_ON_TICKS);
+        status_led_delay(STATUS_LED_STARTUP_BLINK_ON_TICKS);
         status_led_set(false);
-        vTaskDelay(STATUS_LED_STARTUP_BLINK_OFF_TICKS);
+        status_led_delay(STATUS_LED_STARTUP_BLINK_OFF_TICKS);
     }
 }
 
 static void status_led_task(void *arg)
 {
     while (true) {
+        if (!s_context.is_enabled()) {
+            status_led_set(false);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         const bool upstream_connected = s_context.is_upstream_connected();
         const int client_count = s_context.get_client_count();
         const int blink_count = client_count > 0 ? client_count : 0;
@@ -39,18 +60,18 @@ static void status_led_task(void *arg)
 
         if (blink_count == 0) {
             status_led_set(base_on);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            status_led_delay(pdMS_TO_TICKS(1000));
             continue;
         }
 
         for (int i = 0; i < blink_count; ++i) {
             status_led_set(!base_on);
-            vTaskDelay(pdMS_TO_TICKS(180));
+            status_led_delay(pdMS_TO_TICKS(180));
             status_led_set(base_on);
-            vTaskDelay(pdMS_TO_TICKS(220));
+            status_led_delay(pdMS_TO_TICKS(220));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1200));
+        status_led_delay(pdMS_TO_TICKS(1200));
     }
 }
 
@@ -71,6 +92,8 @@ esp_err_t status_led_start(const status_led_context_t *context)
     }
 
     ESP_RETURN_ON_FALSE(context != NULL, ESP_ERR_INVALID_ARG, TAG, "Context is required");
+    ESP_RETURN_ON_FALSE(context->is_enabled != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "LED enable callback is required");
     ESP_RETURN_ON_FALSE(context->is_upstream_connected != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "Upstream status callback is required");
     ESP_RETURN_ON_FALSE(context->get_client_count != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -82,7 +105,9 @@ esp_err_t status_led_start(const status_led_context_t *context)
 
     ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "Failed to configure status LED GPIO");
     status_led_set(false);
-    status_led_run_startup_pattern();
+    if (s_context.is_enabled()) {
+        status_led_run_startup_pattern();
+    }
 
     task_result = xTaskCreate(status_led_task, "status_led_task", 2048, NULL, 1,
                               &s_status_led_task_handle);

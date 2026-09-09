@@ -14,6 +14,8 @@ esp_err_t repeater_wifi_get_softap_ip_info(const repeater_runtime_t *runtime,
                                            esp_netif_ip_info_t *out_ip_info);
 esp_err_t repeater_wifi_get_upstream_ip_info(const repeater_runtime_t *runtime,
                                              esp_netif_ip_info_t *out_ip_info);
+esp_err_t repeater_wifi_get_upstream_rssi(const repeater_runtime_t *runtime, int *out_rssi);
+esp_err_t repeater_wifi_get_upstream_channel(const repeater_runtime_t *runtime, int *out_channel);
 esp_err_t repeater_wifi_read_softap_mac(char *out_mac, size_t out_mac_size);
 bool repeater_wifi_is_upstream_connected(const repeater_runtime_t *runtime);
 bool repeater_wifi_is_using_backup_upstream(const repeater_runtime_t *runtime);

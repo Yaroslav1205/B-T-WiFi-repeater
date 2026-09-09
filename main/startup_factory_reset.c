@@ -61,10 +61,12 @@ static esp_err_t startup_configure_boot_button(void)
 
 static void startup_blink_factory_reset_complete(void)
 {
-    startup_set_status_led(false);
-    vTaskDelay(pdMS_TO_TICKS(PROJECT_FACTORY_RESET_BLINK_MS));
-    startup_set_status_led(true);
-    vTaskDelay(pdMS_TO_TICKS(PROJECT_FACTORY_RESET_BLINK_MS));
+    for (int i = 0; i < 3; ++i) {
+        startup_set_status_led(false);
+        vTaskDelay(pdMS_TO_TICKS(PROJECT_FACTORY_RESET_BLINK_MS));
+        startup_set_status_led(true);
+        vTaskDelay(pdMS_TO_TICKS(PROJECT_FACTORY_RESET_BLINK_MS));
+    }
     startup_set_status_led(false);
 }
 
@@ -82,9 +84,18 @@ esp_err_t startup_factory_reset_check(void)
     ESP_RETURN_ON_ERROR(startup_configure_status_led(), TAG,
                         "Failed to prepare status LED for startup factory reset check");
 
-    if (!startup_is_boot_button_pressed()) {
-        return ESP_OK;
+    /* BOOT is a strapping pin: let the user press it after normal ROM boot. */
+    ESP_LOGI(TAG, "Press BOOT within %u ms, then hold for %u ms to factory reset",
+             (unsigned int)PROJECT_FACTORY_RESET_STARTUP_WINDOW_MS,
+             (unsigned int)PROJECT_FACTORY_RESET_HOLD_MS);
+    while (!startup_is_boot_button_pressed()) {
+        if (elapsed_ms >= PROJECT_FACTORY_RESET_STARTUP_WINDOW_MS) {
+            return ESP_OK;
+        }
+        vTaskDelay(poll_ticks);
+        elapsed_ms += PROJECT_FACTORY_RESET_POLL_MS;
     }
+    elapsed_ms = 0;
 
     ESP_LOGW(TAG, "BOOT button pressed on startup, hold for %u ms to factory reset",
              (unsigned int)PROJECT_FACTORY_RESET_HOLD_MS);
@@ -108,8 +119,11 @@ esp_err_t startup_factory_reset_check(void)
     }
 
     ESP_LOGW(TAG, "Factory reset requested from BOOT button");
-    ESP_RETURN_ON_ERROR(repeater_settings_factory_reset(), TAG,
-                        "Failed to erase saved settings during startup factory reset");
+    esp_err_t err = repeater_settings_factory_reset();
+    if (err != ESP_OK) {
+        startup_set_status_led(false);
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to erase saved settings during startup factory reset");
+    }
     startup_blink_factory_reset_complete();
     ESP_LOGI(TAG, "Factory reset complete, continuing normal startup");
     return ESP_OK;

@@ -9,7 +9,7 @@ ESP32-C3 Wi-Fi repeater project in `AP + STA` mode with:
 - web UI with Basic Auth
 - NVS-persisted transmit power level
 - client table with MAC and RSSI
-- status LED that shows uplink state and connected client count
+- status LED that shows uplink state and connected client count, with a saved on/off setting
 - OTA firmware updates from GitHub Releases
 
 ## Project structure
@@ -41,6 +41,32 @@ ESP32-C3 Wi-Fi repeater project in `AP + STA` mode with:
 - `main/project_wifi_config.h`  
   Single place for defaults such as device name, Wi-Fi credentials, LED config, time sync, and web login/password.
 
+## Status LED
+
+In the web UI, open **Access and appearance → Appearance**, set **Status LED** to
+**Off**, and click **Save settings**. The light turns off without restarting the
+repeater. The setting persists across restarts and also suppresses the startup
+blink pattern. Select **On** to restore normal indication.
+
+The default is **On**. A factory reset restores this default; holding BOOT during
+startup still uses the LED to indicate the reset procedure.
+`PROJECT_STATUS_LED_ENABLED` remains the hardware-level switch in the build configuration.
+
+## Factory reset
+
+1. Power on (or press RESET) with **BOOT released**. On ESP32-C3, holding BOOT
+   during power-on/reset selects the ROM download mode and the application cannot run.
+2. Press BOOT within the first **5 seconds** of application startup, then hold it
+   for **10 seconds**. The status LED stays on while the button is held.
+3. **Three flashes** confirm that settings were erased successfully. Release BOOT;
+   the repeater continues normal startup without another power cycle.
+   Releasing BOOT before the 10 seconds cancels the reset.
+
+Reset indication works even when the saved status LED option is Off. After reset,
+**hidden SSID is Off** (the network is visible) and **status LED is On**.
+The default network is **B-T WiFi repeater**, password **12345678**; the web login
+is **admin / admin**. Client history is preserved.
+
 ## Main configuration points
 
 Edit `main/project_wifi_config.h` to change:
@@ -71,7 +97,7 @@ Default web login:
 
 ```text
 user: admin
-pass: change-me
+pass: admin
 ```
 
 ## OTA updates through GitHub

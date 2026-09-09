@@ -6,6 +6,7 @@
 #include <string.h>
 #include "esp_check.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "lwip/inet.h"
 #include "project_wifi_config.h"
 #include "router_web.h"
@@ -13,6 +14,12 @@
 static const char *TAG = "RouterWeb";
 static router_web_context_t s_context_storage;
 static const router_web_context_t *s_context = &s_context_storage;
+static const char ROUTER_WEB_FAVICON_SVG[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+    "<rect width='64' height='64' rx='16' fill='#ffffff'/>"
+    "<text x='32' y='40' text-anchor='middle' font-family='Trebuchet MS, Segoe UI, sans-serif' "
+    "font-size='26' font-weight='800' letter-spacing='-1.2' fill='" PROJECT_BRAND_COLOR_HEX "'>B-T</text>"
+    "</svg>";
 
 #define ROUTER_WEB_AUTH_REALM PROJECT_DEVICE_NAME
 #define ROUTER_WEB_AUTH_RAW_LEN \
@@ -23,7 +30,8 @@ static const router_web_context_t *s_context = &s_context_storage;
 #define ROUTER_WEB_THEME_OPTIONS_BUFFER_SIZE 256
 #define ROUTER_WEB_SOFTAP_AUTH_OPTIONS_BUFFER_SIZE 256
 #define ROUTER_WEB_CLIENT_ROW_ESTIMATE \
-    (ROUTER_WEB_ESCAPED_DEVICE_DESCRIPTION_BUFFER_SIZE + 896)
+    (ROUTER_WEB_ESCAPED_DEVICE_DESCRIPTION_BUFFER_SIZE + \
+     ROUTER_WEB_ESCAPED_CLIENT_HOSTNAME_BUFFER_SIZE + 1088)
 #define ROUTER_WEB_CLIENTS_BUFFER_BASE_SIZE 256
 #define ROUTER_WEB_HTML_BUFFER_BASE_SIZE 32768
 #define ROUTER_WEB_MAX_CLIENT_ROWS REPEATER_CLIENT_HISTORY_MAX_ENTRIES
@@ -41,13 +49,15 @@ static const router_web_context_t *s_context = &s_context_storage;
     ROUTER_WEB_ESCAPED_BUFFER_SIZE(REPEATER_WEB_AUTH_PASSWORD_MAX_LEN)
 #define ROUTER_WEB_ESCAPED_DEVICE_DESCRIPTION_BUFFER_SIZE \
     ROUTER_WEB_ESCAPED_BUFFER_SIZE(REPEATER_DEVICE_DESCRIPTION_MAX_LEN)
+#define ROUTER_WEB_ESCAPED_CLIENT_HOSTNAME_BUFFER_SIZE \
+    ROUTER_WEB_ESCAPED_BUFFER_SIZE(REPEATER_CLIENT_HOSTNAME_MAX_LEN)
 #define ROUTER_WEB_ESCAPED_IP_TEXT_BUFFER_SIZE ROUTER_WEB_ESCAPED_BUFFER_SIZE(31)
 #define ROUTER_WEB_ESCAPED_FIRMWARE_VERSION_BUFFER_SIZE \
     ROUTER_WEB_ESCAPED_BUFFER_SIZE(REPEATER_FIRMWARE_VERSION_MAX_LEN)
 #define ROUTER_WEB_ESCAPED_FIRMWARE_MESSAGE_BUFFER_SIZE \
     ROUTER_WEB_ESCAPED_BUFFER_SIZE(REPEATER_FIRMWARE_MESSAGE_MAX_LEN)
 #define ROUTER_WEB_DEVICE_FORM_BODY_SIZE 192
-#define ROUTER_WEB_SETTINGS_FORM_BODY_SIZE 1536
+#define ROUTER_WEB_SETTINGS_FORM_BODY_SIZE 2048
 #define ROUTER_WEB_QUERY_BUFFER_SIZE 128
 #define ROUTER_WEB_STRINGIFY_INNER(value) #value
 #define ROUTER_WEB_STRINGIFY(value) ROUTER_WEB_STRINGIFY_INNER(value)
@@ -61,8 +71,11 @@ static const router_web_context_t *s_context = &s_context_storage;
     ROUTER_WEB_STRINGIFY(REPEATER_WEB_AUTH_USERNAME_MAX_LEN)
 #define ROUTER_WEB_AUTH_PASSWORD_MAX_LEN_STR \
     ROUTER_WEB_STRINGIFY(REPEATER_WEB_AUTH_PASSWORD_MAX_LEN)
+#define ROUTER_WEB_FAILSAFE_REBOOT_MAX_TIMEOUT_MINUTES_STR \
+    ROUTER_WEB_STRINGIFY(PROJECT_FAILSAFE_REBOOT_MAX_TIMEOUT_MINUTES)
 
 static char s_expected_auth_header[ROUTER_WEB_AUTH_HEADER_LEN];
+
 
 static size_t base64_encode(const uint8_t *input, size_t input_len, char *output, size_t output_len)
 {
@@ -286,6 +299,20 @@ static esp_err_t read_form_value(const char *body, const char *field_name,
     return ESP_OK;
 }
 
+static esp_err_t read_form_value_or_default(const char *body, const char *field_name,
+                                            char *value, size_t value_size,
+                                            const char *default_value)
+{
+    esp_err_t err = read_form_value(body, field_name, value, value_size);
+
+    if (err == ESP_ERR_NOT_FOUND) {
+        snprintf(value, value_size, "%s", default_value != NULL ? default_value : "");
+        return ESP_OK;
+    }
+
+    return err;
+}
+
 static esp_err_t html_escape_string(const char *input, char *output, size_t output_size)
 {
     const char *source = input != NULL ? input : "";
@@ -380,6 +407,25 @@ static esp_err_t parse_hhmm_time(const char *value, uint8_t *hour, uint8_t *minu
     return ESP_OK;
 }
 
+static esp_err_t parse_timeout_minutes(const char *value, uint8_t *timeout_minutes)
+{
+    char *end = NULL;
+    unsigned long parsed_value;
+
+    if (value == NULL || timeout_minutes == NULL || value[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    parsed_value = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' ||
+        parsed_value > PROJECT_FAILSAFE_REBOOT_MAX_TIMEOUT_MINUTES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *timeout_minutes = (uint8_t)parsed_value;
+    return ESP_OK;
+}
+
 static esp_err_t web_root_get_handler(httpd_req_t *req)
 {
     char *options_html = NULL;
@@ -405,8 +451,11 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
     char escaped_firmware_status_message[ROUTER_WEB_ESCAPED_FIRMWARE_MESSAGE_BUFFER_SIZE];
     char chip_temperature[24];
     char reboot_time[6];
+    uint8_t failsafe_reboot_timeout_minutes = 0;
     char reboot_summary[32];
     char upstream_ip_text[32];
+    char upstream_rssi_text[24];
+    char upstream_status_text[48];
     char upstream_connected_at_text[32];
     char upstream_packet_summary[64];
     char upstream_rx_packets_text[24];
@@ -424,6 +473,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
     size_t client_count = 0;
     const repeater_auto_reboot_config_t auto_reboot_config =
         s_context->get_auto_reboot_config();
+    failsafe_reboot_timeout_minutes = s_context->get_failsafe_reboot_timeout_minutes != NULL
+        ? s_context->get_failsafe_reboot_timeout_minutes()
+        : PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
     const repeater_station_config_t *station_config =
         s_context->get_station_config != NULL ? s_context->get_station_config() : NULL;
     const repeater_station_config_t *backup_station_config =
@@ -525,6 +577,10 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
     client_count = s_context->get_clients != NULL
         ? s_context->get_clients(clients, ROUTER_WEB_MAX_CLIENT_ROWS)
         : 0;
+    const int active_client_count = s_context->get_client_count != NULL
+        ? s_context->get_client_count()
+        : 0;
+    const char *client_count_class = active_client_count > 0 ? "is-online" : "";
 
     clients_html_capacity += client_count * ROUTER_WEB_CLIENT_ROW_ESTIMATE;
     clients_html = calloc(1, clients_html_capacity);
@@ -582,15 +638,33 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
     } else {
         for (size_t i = 0; i < client_count; ++i) {
             char escaped_description[ROUTER_WEB_ESCAPED_DEVICE_DESCRIPTION_BUFFER_SIZE];
+            char escaped_hostname[ROUTER_WEB_ESCAPED_CLIENT_HOSTNAME_BUFFER_SIZE];
+            char escaped_local_ip[ROUTER_WEB_ESCAPED_IP_TEXT_BUFFER_SIZE];
             char first_seen[20];
             char last_seen[20];
+            const char *client_lines_class = clients[i].is_connected
+                ? "client-lines client-lines-online"
+                : "client-lines";
+            const char *hostname_text = clients[i].hostname[0] != '\0'
+                ? clients[i].hostname
+                : "Not reported";
+            const char *local_ip_text = clients[i].last_local_ip[0] != '\0'
+                ? clients[i].last_local_ip
+                : "Unknown";
+            const char *description_form_class = clients[i].is_connected
+                ? "inline-label-form inline-label-form-online"
+                : "inline-label-form";
             const char *connection_signal_html = clients[i].is_connected
                 ? "<span class=\"rssi-good\">Online, %d dBm</span>"
                 : "<span class=\"status-neutral\">Offline</span>";
             if (html_escape_string(clients[i].description, escaped_description,
-                                   sizeof(escaped_description)) != ESP_OK) {
+                                   sizeof(escaped_description)) != ESP_OK ||
+                html_escape_string(hostname_text, escaped_hostname,
+                                   sizeof(escaped_hostname)) != ESP_OK ||
+                html_escape_string(local_ip_text, escaped_local_ip,
+                                   sizeof(escaped_local_ip)) != ESP_OK) {
                 response_err = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                                   "Description buffer too small");
+                                                   "Client buffer too small");
                 goto cleanup;
             }
 
@@ -601,10 +675,12 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
                 clients_html + clients_offset,
                 clients_html_capacity - clients_offset,
                 "<article class=\"client-card\">"
-                "<div class=\"client-lines\">"
+                "<div class=\"%s\">"
                 "<p><strong>MAC</strong><span>%s</span></p>"
+                "<p><strong>Hostname</strong><span>%s</span></p>"
+                "<p><strong>Local IP</strong><span>%s</span></p>"
                 "<p><strong>Status</strong>",
-                clients[i].mac);
+                client_lines_class, clients[i].mac, escaped_hostname, escaped_local_ip);
 
             if (written < 0 || (size_t)written >= clients_html_capacity - clients_offset) {
                 response_err = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -635,13 +711,13 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
                 "<p><strong>First seen</strong><span>%s</span></p>"
                 "<p><strong>Last seen</strong><span>%s</span></p>"
                 "</div>"
-                "<form class=\"inline-label-form\" method=\"post\" action=\"/device-label\">"
+                "<form class=\"%s\" method=\"post\" action=\"/device-label\">"
                 "<input type=\"hidden\" name=\"mac\" value=\"%s\">"
                 "<input class=\"text-input\" type=\"text\" name=\"description\" maxlength=\"" ROUTER_WEB_DEVICE_DESCRIPTION_MAX_LEN_STR "\" placeholder=\"Device name or note\" value=\"%s\">"
                 "<button class=\"compact-button\" type=\"submit\">Save</button>"
                 "</form>"
                 "</article>",
-                first_seen, last_seen, clients[i].mac, escaped_description);
+                first_seen, last_seen, description_form_class, clients[i].mac, escaped_description);
 
             if (written < 0 || (size_t)written >= clients_html_capacity - clients_offset) {
                 response_err = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -659,12 +735,20 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
              auto_reboot_config.enabled ? "On" : "Off",
              reboot_hour, reboot_minute);
     const bool upstream_connected = s_context->is_upstream_connected();
-    const char *upstream_status = upstream_connected ? "Online" : "Offline";
+    const char *upstream_status = upstream_connected ? "Online, %s" : "Offline";
     const char *upstream_status_class = upstream_connected ? "is-online" : "is-offline";
     const float chip_temperature_c = s_context->get_chip_temperature_c != NULL
         ? s_context->get_chip_temperature_c()
         : NAN;
     esp_netif_ip_info_t upstream_ip_info;
+    int upstream_rssi = 0;
+    int upstream_channel = 0;
+    const bool upstream_rssi_available =
+        s_context->get_upstream_rssi != NULL &&
+        s_context->get_upstream_rssi(&upstream_rssi) == ESP_OK;
+    const bool upstream_channel_available =
+        s_context->get_upstream_channel != NULL &&
+        s_context->get_upstream_channel(&upstream_channel) == ESP_OK;
 
     snprintf(upstream_ip_text, sizeof(upstream_ip_text), "%s", "Not assigned");
     if (s_context->get_upstream_ip_info != NULL &&
@@ -682,6 +766,21 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
 
     format_temperature_text(chip_temperature_c, chip_temperature, sizeof(chip_temperature),
                             "Unavailable");
+    if (upstream_rssi_available) {
+        snprintf(upstream_rssi_text, sizeof(upstream_rssi_text), "%d dBm", upstream_rssi);
+    } else {
+        snprintf(upstream_rssi_text, sizeof(upstream_rssi_text), "%s", "Unavailable");
+    }
+    if (upstream_connected && upstream_rssi_available && upstream_channel_available) {
+        snprintf(upstream_status_text, sizeof(upstream_status_text), "Online, %s, Ch %d",
+                 upstream_rssi_text, upstream_channel);
+    } else if (upstream_connected && upstream_rssi_available) {
+        snprintf(upstream_status_text, sizeof(upstream_status_text), upstream_status,
+                 upstream_rssi_text);
+    } else {
+        snprintf(upstream_status_text, sizeof(upstream_status_text), "%s",
+                 upstream_connected ? "Online" : "Offline");
+    }
     format_client_timestamp(upstream_connected_at_epoch, upstream_connected_at_text,
                             sizeof(upstream_connected_at_text));
 
@@ -753,13 +852,14 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<!doctype html>"
         "<html data-theme=\"%s\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>" PROJECT_DEVICE_NAME "</title>"
         "<style>"
         ":root{color-scheme:light;"
         "--bg:#f6efe5;--bg-deep:#dfe8fb;--panel:rgba(255,255,255,.82);--panel-strong:#ffffff;--panel-alt:rgba(244,247,252,.86);"
-        "--text:#18212f;--muted:#667085;--border:rgba(95,118,148,.18);--accent:#1f6feb;--accent-strong:#1146a6;--accent-text:#ffffff;"
+        "--text:#18212f;--muted:#667085;--border:rgba(95,118,148,.18);--accent:#1f6feb;--accent-strong:" PROJECT_BRAND_COLOR_HEX ";--accent-text:#ffffff;"
         "--success:#168252;--danger:#d33d2f;--warning:#c26a12;--shadow:0 24px 60px rgba(26,39,68,.12);--shadow-soft:0 12px 28px rgba(26,39,68,.08);"
-        "--font-main:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;--radius:24px;--radius-sm:18px;--line-copy:1.5;}"
+        "--font-main:" PROJECT_WEB_FONT_STACK ";--radius:24px;--radius-sm:18px;--line-copy:1.5;}"
         "html[data-theme='dark']{color-scheme:dark;"
         "--bg:#09111f;--bg-deep:#13213a;--panel:rgba(12,22,38,.84);--panel-strong:#14233d;--panel-alt:rgba(20,35,61,.88);"
         "--text:#edf2fb;--muted:#9ab0cf;--border:rgba(151,174,207,.16);--accent:#7dc1ff;--accent-strong:#4f9eff;--accent-text:#08101d;"
@@ -771,10 +871,10 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         ".shell{position:relative;z-index:1;max-width:1120px;margin:0 auto;padding:24px;display:grid;gap:18px;}"
         ".panel,.accordion-item,.info-card,.settings-card,table{border:1px solid var(--border);background:var(--panel);box-shadow:var(--shadow-soft);backdrop-filter:blur(18px);}"
         ".panel,.hero{border-radius:var(--radius);padding:22px;}"
-        ".hero{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,.9fr);gap:18px;align-items:end;overflow:hidden;position:relative;}"
+        ".hero{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,.9fr);gap:18px;align-items:center;overflow:hidden;position:relative;}"
         ".hero::after{content:'';position:absolute;right:-48px;top:-48px;width:180px;height:180px;border-radius:999px;background:linear-gradient(135deg,rgba(31,111,235,.18),rgba(255,255,255,0));}"
-        ".hero-copy,.hero-side{display:grid;gap:10px;position:relative;z-index:1;}"
-        ".hero-copy h1{margin:0;font-size:clamp(30px,6vw,48px);line-height:1.02;max-width:12ch;}"
+        ".hero-copy,.hero-side{display:grid;gap:10px;position:relative;z-index:1;}.hero-copy{align-content:center;}"
+        ".hero-copy h1{margin:0;font-size:clamp(30px,6vw,48px);line-height:1.02;max-width:12ch;color:var(--accent-strong);}"
         ".hero-copy p,.hero-side p,.summary-copy span,.card-heading p,.hint,.info-card small,.notice-banner p{margin:0;color:var(--muted);font-size:14px;}"
         ".eyebrow{margin:0;color:var(--accent-strong);font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;}"
         ".hero-side{justify-items:stretch;align-content:center;gap:8px;}"
@@ -831,11 +931,14 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         ".client-lines p{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin:0;}"
         ".client-lines strong{display:block;min-width:96px;color:var(--muted);font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;}"
         ".client-lines span{display:block;font-size:15px;font-weight:800;line-height:1.25;word-break:break-word;color:var(--text);}"
+        ".client-lines-online strong,.client-lines-online span{color:var(--success);}"
         ".client-lines span.rssi-good{color:var(--success);}"
         ".client-lines span.rssi-mid{color:var(--warning);}"
         ".client-lines span.rssi-low{color:var(--danger);}"
-        ".inline-label-form{display:grid;grid-template-columns:minmax(0,1fr) 96px;gap:10px;align-items:start;padding-top:6px;border-top:1px solid var(--border);}"
-        ".compact-button{width:96px;margin:0;padding:12px 10px;font-size:13px;}"
+        ".inline-label-form{display:grid;grid-template-columns:minmax(0,1fr) 76px;gap:10px;align-items:start;padding-top:6px;border-top:1px solid var(--border);}"
+        ".inline-label-form-online .text-input{color:var(--success);}"
+        ".inline-label-form-online .text-input::placeholder{color:var(--success);opacity:.7;}"
+        ".compact-button{width:76px;margin:0;padding:12px 8px;font-size:13px;}"
         ".rssi-good{color:var(--success);font-weight:800;}"
         ".rssi-mid{color:var(--warning);font-weight:800;}"
         ".rssi-low{color:var(--danger);font-weight:800;}"
@@ -855,9 +958,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<p><strong>Local IP</strong><span>%s</span></p>"
         "<p><strong>Repeater MAC</strong><span>%s</span></p>"
         "<p><strong>Connected at</strong><span>%s</span></p>"
-        "<p><strong>Radio</strong><span>%s</span></p>"
+        "<p><strong>Radio to clients</strong><span>%s</span></p>"
         "<p><strong>Temperature</strong><span>%s</span></p>"
-        "<p><strong>Clients</strong><span>%d</span></p>"
+        "<p><strong>Clients</strong><span class=\"%s\">%d (%d)</span></p>"
         "</div>"
         "</header>"
         "%s"
@@ -893,6 +996,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<div class=\"field-stack\">"
         "<label class=\"field-label\" for=\"softap_auth\">SoftAP encryption</label>"
         "<select id=\"softap_auth\" name=\"softap_auth\">%s</select>"
+        "<input type=\"hidden\" name=\"softap_hidden_present\" value=\"1\">"
+        "<label class=\"toggle\"><input type=\"checkbox\" name=\"softap_ssid_hidden\" value=\"1\" %s> Hide SoftAP SSID</label>"
+        "<p class=\"hint\">Hidden networks must be entered manually on client devices.</p>"
         "<p class=\"hint\">Leave the password empty to make the local network open.</p>"
         "</div>"
         "</div></section>"
@@ -904,7 +1010,7 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "</div>"
         "</details>"
         "<details class=\"accordion-item\">"
-        "<summary><div class=\"summary-copy\"><strong>Access and appearance</strong><span>Web login, radio strength, theme, and scheduled restart controls.</span></div><span class=\"summary-meta\">System</span></summary>"
+        "<summary><div class=\"summary-copy\"><strong>Access and appearance</strong><span>Web login, radio strength, theme, status LED, and scheduled restart controls.</span></div><span class=\"summary-meta\">System</span></summary>"
         "<div class=\"accordion-content\">"
         "<div class=\"settings-grid\">"
         "<section class=\"settings-card\"><div class=\"card-heading\"><h4>Web access</h4><p>Credentials for the local settings page.</p></div>"
@@ -924,6 +1030,10 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<div class=\"field-stack\">"
         "<label class=\"field-label\" for=\"theme\">Interface theme</label>"
         "<select id=\"theme\" name=\"theme\">%s</select>"
+        "<label class=\"field-label\" for=\"status_led_enabled\">Status LED</label>"
+        "<select id=\"status_led_enabled\" name=\"status_led_enabled\" %s>"
+        "<option value=\"1\" %s>On</option><option value=\"0\" %s>Off</option></select>"
+        "<p class=\"hint\">Turn off the status light for nighttime use. Applied after saving and remembered after restart.</p>"
         "</div></section>"
         "<section class=\"settings-card\"><div class=\"card-heading\"><h4>Scheduled reboot</h4><p>Optional daily restart after NTP time sync is available.</p></div>"
         "<div class=\"field-stack\">"
@@ -934,6 +1044,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<label class=\"field-label\" for=\"reboot_time\">Daily reboot time</label>"
         "<input id=\"reboot_time\" type=\"time\" name=\"reboot_time\" step=\"60\" value=\"%s\">"
         "<p class=\"hint\">Runs automatically after time synchronization is ready.</p>"
+        "<label class=\"field-label\" for=\"failsafe_reboot_timeout\">Failsafe reboot timeout</label>"
+        "<input id=\"failsafe_reboot_timeout\" type=\"number\" name=\"failsafe_reboot_timeout\" min=\"0\" max=\"" ROUTER_WEB_FAILSAFE_REBOOT_MAX_TIMEOUT_MINUTES_STR "\" step=\"1\" value=\"%u\" inputmode=\"numeric\">"
+        "<p class=\"hint\">Minutes without upstream internet or SoftAP clients before a protective reboot. Set 0 to disable this function.</p>"
         "</div></section>"
         "</div>"
         "<div class=\"panel-submit\">"
@@ -973,7 +1086,7 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "</body></html>",
         s_context->get_theme_token(),
         upstream_status_class,
-        upstream_status,
+        upstream_status_text,
         active_upstream_role,
         escaped_active_upstream_ssid,
         escaped_active_upstream_ip,
@@ -981,7 +1094,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         upstream_connected_at_text,
         s_context->get_signal_level_label(),
         chip_temperature,
-        s_context->get_client_count(),
+        client_count_class,
+        active_client_count,
+        (int)client_count,
         notice_html,
         escaped_station_ssid,
         escaped_station_password,
@@ -990,12 +1105,17 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         escaped_softap_ssid,
         escaped_softap_password,
         softap_auth_options_html,
+        softap_config != NULL && softap_config->ssid_hidden ? "checked" : "",
         escaped_web_username,
         escaped_web_password,
         options_html,
         theme_options_html,
+        PROJECT_STATUS_LED_ENABLED ? "" : "disabled",
+        s_context->is_status_led_enabled() ? "selected" : "",
+        s_context->is_status_led_enabled() ? "" : "selected",
         auto_reboot_config.enabled ? "checked" : "",
         reboot_time,
+        (unsigned int)failsafe_reboot_timeout_minutes,
         clients_html,
         escaped_firmware_current_version,
         escaped_firmware_available_version,
@@ -1030,12 +1150,36 @@ static esp_err_t redirect_to_root(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
-
 static bool strings_equal_or_empty(const char *left, const char *right)
 {
     const char *lhs = left != NULL ? left : "";
     const char *rhs = right != NULL ? right : "";
     return strcmp(lhs, rhs) == 0;
+}
+
+static void preserve_existing_secret_if_blank(const char *submitted_identity,
+                                             const char *current_identity,
+                                             char *submitted_secret,
+                                             size_t submitted_secret_size,
+                                             const char *current_secret)
+{
+    if (submitted_secret == NULL || submitted_secret_size == 0) {
+        return;
+    }
+
+    if ((submitted_identity != NULL ? submitted_identity[0] : '\0') == '\0') {
+        return;
+    }
+
+    if (submitted_secret[0] != '\0' || current_secret == NULL || current_secret[0] == '\0') {
+        return;
+    }
+
+    if (!strings_equal_or_empty(submitted_identity, current_identity)) {
+        return;
+    }
+
+    snprintf(submitted_secret, submitted_secret_size, "%s", current_secret);
 }
 
 static esp_err_t send_success_page(httpd_req_t *req, const char *title,
@@ -1050,14 +1194,15 @@ static esp_err_t send_success_page(httpd_req_t *req, const char *title,
         "<!doctype html>"
         "<html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>%s</title>"
         "<style>"
-        "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
+        "body{margin:0;font-family:" PROJECT_WEB_FONT_STACK ";background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
         ".card{max-width:560px;width:100%%;background:rgba(255,255,255,.88);border:1px solid rgba(95,118,148,.18);border-radius:28px;padding:28px;box-shadow:0 24px 60px rgba(26,39,68,.12);backdrop-filter:blur(18px);}"
         "h1{margin:0 0 12px;font-size:28px;line-height:1.1;}p{margin:0 0 12px;color:#667085;font-size:14px;}"
         ".note{padding:18px;border:1px solid rgba(95,118,148,.18);border-radius:20px;background:rgba(244,247,252,.9);margin:18px 0;}"
         ".note p:last-child{margin-bottom:0;}"
-        ".action{display:inline-block;margin-top:4px;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb,#1146a6);color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
+        ".action{display:inline-block;margin-top:4px;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb," PROJECT_BRAND_COLOR_HEX ");color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
         "</style></head><body><main class=\"card\">"
         "<h1>%s</h1>"
         "<p>%s</p>"
@@ -1154,15 +1299,16 @@ static esp_err_t send_firmware_action_page(httpd_req_t *req, const char *title,
         "<!doctype html>"
         "<html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>%s</title>"
         "<style>"
-        "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
+        "body{margin:0;font-family:" PROJECT_WEB_FONT_STACK ";background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
         ".card{max-width:680px;width:100%%;background:rgba(255,255,255,.88);border:1px solid rgba(95,118,148,.18);border-radius:28px;padding:28px;display:grid;gap:16px;box-shadow:0 24px 60px rgba(26,39,68,.12);backdrop-filter:blur(18px);}"
         "h1{margin:0;font-size:28px;line-height:1.1;}p{margin:0;color:#667085;font-size:14px;}"
-        ".badge{display:inline-flex;align-items:center;width:max-content;padding:6px 12px;border-radius:999px;background:rgba(31,111,235,.1);color:#1146a6;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;}"
+        ".badge{display:inline-flex;align-items:center;width:max-content;padding:6px 12px;border-radius:999px;background:rgba(31,111,235,.1);color:" PROJECT_BRAND_COLOR_HEX ";font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;}"
         ".note{padding:18px;border:1px solid rgba(95,118,148,.18);border-radius:20px;background:rgba(244,247,252,.9);display:grid;gap:8px;}"
         ".actions{display:flex;flex-wrap:wrap;gap:12px;}"
-        ".action{display:inline-block;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb,#1146a6);color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
+        ".action{display:inline-block;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb," PROJECT_BRAND_COLOR_HEX ");color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
         ".action.secondary{background:rgba(244,247,252,.95);color:#18212f;box-shadow:none;border:1px solid rgba(95,118,148,.18);}"
         "</style></head><body><main class=\"card\">"
         "<span class=\"badge\">%s</span>"
@@ -1193,8 +1339,9 @@ static esp_err_t send_firmware_action_page(httpd_req_t *req, const char *title,
 
 static esp_err_t web_favicon_get_handler(httpd_req_t *req)
 {
-    httpd_resp_set_status(req, "204 No Content");
-    return httpd_resp_send(req, NULL, 0);
+    httpd_resp_set_type(req, "image/svg+xml");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    return httpd_resp_send(req, ROUTER_WEB_FAVICON_SVG, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t web_signal_post_handler(httpd_req_t *req)
@@ -1313,10 +1460,15 @@ static esp_err_t web_device_label_post_handler(httpd_req_t *req)
 
 static esp_err_t web_auto_reboot_post_handler(httpd_req_t *req)
 {
-    char body[192];
+    char body[256];
     char reboot_time[16];
+    char failsafe_reboot_timeout_text[8];
+    char current_failsafe_reboot_timeout_text[8];
     uint8_t hour = 0;
     uint8_t minute = 0;
+    uint8_t failsafe_reboot_timeout_minutes = s_context->get_failsafe_reboot_timeout_minutes != NULL
+        ? s_context->get_failsafe_reboot_timeout_minutes()
+        : PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
     bool enabled = false;
 
     if (!is_request_authorized(req)) {
@@ -1346,11 +1498,25 @@ static esp_err_t web_auto_reboot_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Reboot time must be HH:MM");
     }
 
+    snprintf(current_failsafe_reboot_timeout_text, sizeof(current_failsafe_reboot_timeout_text),
+             "%u", (unsigned int)failsafe_reboot_timeout_minutes);
+    err = read_form_value_or_default(body, "failsafe_reboot_timeout", failsafe_reboot_timeout_text,
+                                     sizeof(failsafe_reboot_timeout_text),
+                                     current_failsafe_reboot_timeout_text);
+    if (err != ESP_OK || parse_timeout_minutes(failsafe_reboot_timeout_text,
+                                               &failsafe_reboot_timeout_minutes) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Failsafe timeout must be 0-60 minutes");
+    }
+
     ESP_RETURN_ON_ERROR(s_context->set_auto_reboot_config(enabled, hour, minute), TAG,
                         "Failed to change auto reboot config from web UI");
+    ESP_RETURN_ON_ERROR(s_context->set_failsafe_reboot_timeout_minutes(failsafe_reboot_timeout_minutes),
+                        TAG, "Failed to change failsafe reboot timeout from web UI");
 
-    ESP_LOGI(TAG, "Auto reboot config changed from web UI: %s at %02u:%02u",
-             enabled ? "enabled" : "disabled", hour, minute);
+    ESP_LOGI(TAG, "Auto reboot config changed from web UI: %s at %02u:%02u, failsafe=%u min",
+             enabled ? "enabled" : "disabled", hour, minute,
+             (unsigned int)failsafe_reboot_timeout_minutes);
     return redirect_to_root(req);
 }
 
@@ -1419,24 +1585,38 @@ static esp_err_t web_firmware_update_post_handler(httpd_req_t *req)
 static esp_err_t web_settings_post_handler(httpd_req_t *req)
 {
     char body[ROUTER_WEB_SETTINGS_FORM_BODY_SIZE];
-    char station_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1];
-    char station_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1];
-    char backup_station_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1];
-    char backup_station_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1];
-    char softap_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1];
-    char softap_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1];
-    char softap_auth[16];
-    char web_username[REPEATER_WEB_AUTH_USERNAME_MAX_LEN + 1];
-    char web_password[REPEATER_WEB_AUTH_PASSWORD_MAX_LEN + 1];
-    char level[16];
-    char theme[16];
-    char reboot_time[16];
+    char station_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1] = { 0 };
+    char station_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1] = { 0 };
+    char backup_station_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1] = { 0 };
+    char backup_station_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1] = { 0 };
+    char softap_ssid[REPEATER_WIFI_SSID_MAX_LEN + 1] = { 0 };
+    char softap_password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1] = { 0 };
+    char softap_auth[16] = { 0 };
+    char web_username[REPEATER_WEB_AUTH_USERNAME_MAX_LEN + 1] = { 0 };
+    char web_password[REPEATER_WEB_AUTH_PASSWORD_MAX_LEN + 1] = { 0 };
+    char level[16] = { 0 };
+    char theme[16] = { 0 };
+    char status_led_enabled_text[2] = { 0 };
+    char reboot_time[16] = { 0 };
+    char current_reboot_time[16] = { 0 };
+    char failsafe_reboot_timeout_text[8] = { 0 };
+    char current_failsafe_reboot_timeout_text[8] = { 0 };
+    char reboot_enabled_marker[8] = { 0 };
+    char softap_hidden_marker[8] = { 0 };
     uint8_t hour = 0;
     uint8_t minute = 0;
+    uint8_t failsafe_reboot_timeout_minutes = 0;
     bool enabled = false;
+    bool softap_ssid_hidden = false;
+    bool softap_hidden_field_present = false;
+    bool reboot_fields_present = false;
     bool wifi_settings_changed = false;
     bool softap_settings_changed = false;
     bool web_auth_changed = false;
+    bool signal_level_changed = false;
+    bool theme_changed = false;
+    bool status_led_enabled = s_context->is_status_led_enabled();
+    bool reboot_settings_changed = false;
     const repeater_station_config_t *current_station_config =
         s_context->get_station_config != NULL ? s_context->get_station_config() : NULL;
     const repeater_station_config_t *current_backup_station_config =
@@ -1445,6 +1625,20 @@ static esp_err_t web_settings_post_handler(httpd_req_t *req)
         s_context->get_softap_config != NULL ? s_context->get_softap_config() : NULL;
     const repeater_web_auth_config_t *current_web_auth_config =
         s_context->get_web_auth_config != NULL ? s_context->get_web_auth_config() : NULL;
+    const char *current_signal_level_token =
+        s_context->get_signal_level_token != NULL ? s_context->get_signal_level_token() : "";
+    const char *current_theme_token =
+        s_context->get_theme_token != NULL ? s_context->get_theme_token() : "";
+    const char *current_softap_auth_token =
+        s_context->get_softap_auth_token != NULL ? s_context->get_softap_auth_token() : "";
+    const repeater_auto_reboot_config_t current_auto_reboot_config =
+        s_context->get_auto_reboot_config != NULL
+            ? s_context->get_auto_reboot_config()
+            : (repeater_auto_reboot_config_t){ .enabled = false, .hour = 0, .minute = 0 };
+    const uint8_t current_failsafe_reboot_timeout_minutes =
+        s_context->get_failsafe_reboot_timeout_minutes != NULL
+            ? s_context->get_failsafe_reboot_timeout_minutes()
+            : PROJECT_FAILSAFE_REBOOT_DEFAULT_TIMEOUT_MINUTES;
 
     if (!is_request_authorized(req)) {
         ESP_LOGW(TAG, "Unauthorized settings change request");
@@ -1459,108 +1653,135 @@ static esp_err_t web_settings_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request body too large");
     }
 
-    err = read_form_value(body, "station_ssid", station_ssid, sizeof(station_ssid));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing Station SSID");
-    }
+    snprintf(current_reboot_time, sizeof(current_reboot_time), "%02u:%02u",
+             current_auto_reboot_config.hour, current_auto_reboot_config.minute);
+    snprintf(current_failsafe_reboot_timeout_text, sizeof(current_failsafe_reboot_timeout_text),
+             "%u", (unsigned int)current_failsafe_reboot_timeout_minutes);
+
+    err = read_form_value_or_default(body, "station_ssid", station_ssid, sizeof(station_ssid),
+                                     current_station_config != NULL ? current_station_config->ssid : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Station SSID");
     }
 
-    err = read_form_value(body, "station_password", station_password, sizeof(station_password));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing Station password");
-    }
+    err = read_form_value_or_default(body, "station_password", station_password,
+                                     sizeof(station_password),
+                                     current_station_config != NULL ? current_station_config->password : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Station password");
     }
 
-    err = read_form_value(body, "backup_station_ssid", backup_station_ssid,
-                          sizeof(backup_station_ssid));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing backup Station SSID");
-    }
+    err = read_form_value_or_default(body, "backup_station_ssid", backup_station_ssid,
+                                     sizeof(backup_station_ssid),
+                                     current_backup_station_config != NULL ? current_backup_station_config->ssid : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid backup Station SSID");
     }
 
-    err = read_form_value(body, "backup_station_password", backup_station_password,
-                          sizeof(backup_station_password));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing backup Station password");
-    }
+    err = read_form_value_or_default(body, "backup_station_password", backup_station_password,
+                                     sizeof(backup_station_password),
+                                     current_backup_station_config != NULL ? current_backup_station_config->password : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid backup Station password");
     }
 
-    err = read_form_value(body, "softap_ssid", softap_ssid, sizeof(softap_ssid));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SoftAP SSID");
-    }
+    err = read_form_value_or_default(body, "softap_ssid", softap_ssid, sizeof(softap_ssid),
+                                     current_softap_config != NULL ? current_softap_config->ssid : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid SoftAP SSID");
     }
 
-    err = read_form_value(body, "softap_password", softap_password, sizeof(softap_password));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SoftAP password");
-    }
+    err = read_form_value_or_default(body, "softap_password", softap_password,
+                                     sizeof(softap_password),
+                                     current_softap_config != NULL ? current_softap_config->password : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid SoftAP password");
     }
 
-    err = read_form_value(body, "softap_auth", softap_auth, sizeof(softap_auth));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SoftAP encryption type");
-    }
+    err = read_form_value_or_default(body, "softap_auth", softap_auth, sizeof(softap_auth),
+                                     current_softap_auth_token);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid SoftAP encryption type");
     }
 
-    err = read_form_value(body, "web_username", web_username, sizeof(web_username));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing web login");
-    }
+    softap_hidden_field_present = strstr(body, "softap_hidden_present=") != NULL;
+    softap_ssid_hidden = softap_hidden_field_present
+        ? httpd_query_key_value(body, "softap_ssid_hidden", softap_hidden_marker,
+                                sizeof(softap_hidden_marker)) == ESP_OK
+        : current_softap_config != NULL && current_softap_config->ssid_hidden;
+
+    err = read_form_value_or_default(body, "web_username", web_username, sizeof(web_username),
+                                     current_web_auth_config != NULL ? current_web_auth_config->username : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid web login");
     }
 
-    err = read_form_value(body, "web_password", web_password, sizeof(web_password));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing web password");
-    }
+    err = read_form_value_or_default(body, "web_password", web_password, sizeof(web_password),
+                                     current_web_auth_config != NULL ? current_web_auth_config->password : "");
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid web password");
     }
 
-    err = read_form_value(body, "level", level, sizeof(level));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing signal level");
-    }
+    preserve_existing_secret_if_blank(station_ssid,
+                                      current_station_config != NULL ? current_station_config->ssid : "",
+                                      station_password, sizeof(station_password),
+                                      current_station_config != NULL ? current_station_config->password : "");
+    preserve_existing_secret_if_blank(backup_station_ssid,
+                                      current_backup_station_config != NULL ? current_backup_station_config->ssid : "",
+                                      backup_station_password, sizeof(backup_station_password),
+                                      current_backup_station_config != NULL ? current_backup_station_config->password : "");
+    preserve_existing_secret_if_blank(softap_ssid,
+                                      current_softap_config != NULL ? current_softap_config->ssid : "",
+                                      softap_password, sizeof(softap_password),
+                                      current_softap_config != NULL ? current_softap_config->password : "");
+    preserve_existing_secret_if_blank(web_username,
+                                      current_web_auth_config != NULL ? current_web_auth_config->username : "",
+                                      web_password, sizeof(web_password),
+                                      current_web_auth_config != NULL ? current_web_auth_config->password : "");
+
+    err = read_form_value_or_default(body, "level", level, sizeof(level), current_signal_level_token);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid signal level");
     }
 
-    err = read_form_value(body, "theme", theme, sizeof(theme));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing theme");
-    }
+    err = read_form_value_or_default(body, "theme", theme, sizeof(theme), current_theme_token);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid theme");
     }
 
-    enabled = httpd_query_key_value(body, "reboot_enabled", reboot_time, sizeof(reboot_time)) == ESP_OK;
-
-    err = read_form_value(body, "reboot_time", reboot_time, sizeof(reboot_time));
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing reboot time");
+    err = read_form_value_or_default(body, "status_led_enabled", status_led_enabled_text,
+                                     sizeof(status_led_enabled_text),
+                                     status_led_enabled ? "1" : "0");
+    if (err != ESP_OK ||
+        (strcmp(status_led_enabled_text, "0") != 0 && strcmp(status_led_enabled_text, "1") != 0)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid status LED setting");
     }
+    status_led_enabled = strcmp(status_led_enabled_text, "1") == 0;
+
+    reboot_fields_present = strstr(body, "reboot_time=") != NULL ||
+                            strstr(body, "reboot_enabled=") != NULL;
+    enabled = reboot_fields_present
+        ? httpd_query_key_value(body, "reboot_enabled", reboot_enabled_marker,
+                                sizeof(reboot_enabled_marker)) == ESP_OK
+        : current_auto_reboot_config.enabled;
+
+    err = read_form_value_or_default(body, "reboot_time", reboot_time, sizeof(reboot_time),
+                                     current_reboot_time);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid reboot time");
     }
 
     if (parse_hhmm_time(reboot_time, &hour, &minute) != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Reboot time must be HH:MM");
+    }
+
+    err = read_form_value_or_default(body, "failsafe_reboot_timeout", failsafe_reboot_timeout_text,
+                                     sizeof(failsafe_reboot_timeout_text),
+                                     current_failsafe_reboot_timeout_text);
+    if (err != ESP_OK || parse_timeout_minutes(failsafe_reboot_timeout_text,
+                                               &failsafe_reboot_timeout_minutes) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Failsafe timeout must be 0-60 minutes");
     }
 
     if (s_context->set_wifi_networks == NULL) {
@@ -1578,60 +1799,98 @@ static esp_err_t web_settings_post_handler(httpd_req_t *req)
         !strings_equal_or_empty(backup_station_password, current_backup_station_config->password) ||
         !strings_equal_or_empty(softap_ssid, current_softap_config->ssid) ||
         !strings_equal_or_empty(softap_password, current_softap_config->password) ||
-        !strings_equal_or_empty(softap_auth, s_context->get_softap_auth_token());
+        !strings_equal_or_empty(softap_auth, current_softap_auth_token) ||
+        softap_ssid_hidden != current_softap_config->ssid_hidden;
 
     softap_settings_changed =
         current_softap_config == NULL ||
         !strings_equal_or_empty(softap_ssid, current_softap_config->ssid) ||
         !strings_equal_or_empty(softap_password, current_softap_config->password) ||
-        !strings_equal_or_empty(softap_auth, s_context->get_softap_auth_token());
+        !strings_equal_or_empty(softap_auth, current_softap_auth_token) ||
+        softap_ssid_hidden != current_softap_config->ssid_hidden;
 
     web_auth_changed =
         current_web_auth_config == NULL ||
         !strings_equal_or_empty(web_username, current_web_auth_config->username) ||
         !strings_equal_or_empty(web_password, current_web_auth_config->password);
 
+    signal_level_changed = !strings_equal_or_empty(level, current_signal_level_token);
+    theme_changed = !strings_equal_or_empty(theme, current_theme_token);
+    reboot_settings_changed = enabled != current_auto_reboot_config.enabled ||
+                              hour != current_auto_reboot_config.hour ||
+                              minute != current_auto_reboot_config.minute ||
+                              failsafe_reboot_timeout_minutes !=
+                                  current_failsafe_reboot_timeout_minutes;
+
     if (wifi_settings_changed) {
         err = s_context->set_wifi_networks(station_ssid, station_password,
                                            backup_station_ssid, backup_station_password,
-                                           softap_ssid, softap_password, softap_auth);
+                                           softap_ssid, softap_password, softap_auth,
+                                           softap_ssid_hidden);
         if (err == ESP_ERR_INVALID_ARG) {
             return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                        "Invalid primary, backup, or SoftAP parameters");
         }
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "Not enough NVS space to save Wi-Fi settings");
+        }
         ESP_RETURN_ON_ERROR(err, TAG,
                             "Failed to change uplink and SoftAP parameters from unified settings form");
     }
-    ESP_RETURN_ON_ERROR(s_context->set_signal_level_by_token(level), TAG,
-                        "Failed to change signal level from unified settings form");
-    ESP_RETURN_ON_ERROR(s_context->set_theme_by_token(theme), TAG,
-                        "Failed to change theme from unified settings form");
-    ESP_RETURN_ON_ERROR(s_context->set_auto_reboot_config(enabled, hour, minute), TAG,
-                        "Failed to change auto reboot config from unified settings form");
+
+    if (signal_level_changed) {
+        ESP_RETURN_ON_ERROR(s_context->set_signal_level_by_token(level), TAG,
+                            "Failed to change signal level from unified settings form");
+    }
+
+    if (theme_changed) {
+        ESP_RETURN_ON_ERROR(s_context->set_theme_by_token(theme), TAG,
+                            "Failed to change theme from unified settings form");
+    }
+
+    if (status_led_enabled != s_context->is_status_led_enabled()) {
+        err = s_context->set_status_led_enabled(status_led_enabled);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save status LED setting: %s", esp_err_to_name(err));
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "Failed to save status LED setting");
+        }
+    }
+
+    if (reboot_settings_changed) {
+        ESP_RETURN_ON_ERROR(s_context->set_auto_reboot_config(enabled, hour, minute), TAG,
+                            "Failed to change auto reboot config from unified settings form");
+        ESP_RETURN_ON_ERROR(
+            s_context->set_failsafe_reboot_timeout_minutes(failsafe_reboot_timeout_minutes), TAG,
+            "Failed to change failsafe reboot timeout from unified settings form");
+    }
 
     if (s_context->set_web_auth == NULL) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "Web auth settings are unavailable");
     }
 
-    err = s_context->set_web_auth(web_username, web_password);
-    if (err == ESP_ERR_INVALID_ARG) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "Invalid web login or password");
-    }
-    ESP_RETURN_ON_ERROR(err, TAG,
-                        "Failed to change web auth parameters from unified settings form");
     if (web_auth_changed) {
+        err = s_context->set_web_auth(web_username, web_password);
+        if (err == ESP_ERR_INVALID_ARG) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Invalid web login or password");
+        }
+        ESP_RETURN_ON_ERROR(err, TAG,
+                            "Failed to change web auth parameters from unified settings form");
         ESP_RETURN_ON_ERROR(build_expected_auth_header(), TAG,
                             "Failed to refresh Basic Auth header after web auth change");
     }
 
     ESP_LOGI(TAG,
-             "Settings updated from web UI: primary=%s backup=%s softap=%s web_user=%s level=%s theme=%s reboot=%s %02u:%02u",
+             "Settings updated from web UI: primary=%s backup=%s softap=%s visibility=%s web_user=%s level=%s theme=%s reboot=%s %02u:%02u failsafe=%u min",
              station_ssid,
              backup_station_ssid[0] != '\0' ? backup_station_ssid : "(disabled)",
-             softap_ssid, web_username, level, theme,
-             enabled ? "enabled" : "disabled", hour, minute);
+             softap_ssid, softap_ssid_hidden ? "hidden" : "visible",
+             web_username, level, theme,
+             enabled ? "enabled" : "disabled", hour, minute,
+             (unsigned int)failsafe_reboot_timeout_minutes);
 
     return send_settings_saved_page(req, softap_settings_changed, web_auth_changed,
                                     softap_ssid);
@@ -1661,10 +1920,20 @@ esp_err_t router_web_start(const router_web_context_t *context, httpd_handle_t *
                         "Theme setter callback is required");
     ESP_RETURN_ON_FALSE(context->get_softap_auth_token != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "SoftAP auth token callback is required");
+    ESP_RETURN_ON_FALSE(context->is_status_led_enabled != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "Status LED getter callback is required");
+    ESP_RETURN_ON_FALSE(context->set_status_led_enabled != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "Status LED setter callback is required");
     ESP_RETURN_ON_FALSE(context->get_auto_reboot_config != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "Auto reboot getter callback is required");
     ESP_RETURN_ON_FALSE(context->set_auto_reboot_config != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "Auto reboot setter callback is required");
+    ESP_RETURN_ON_FALSE(context->get_failsafe_reboot_timeout_minutes != NULL,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "Failsafe reboot timeout getter callback is required");
+    ESP_RETURN_ON_FALSE(context->set_failsafe_reboot_timeout_minutes != NULL,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "Failsafe reboot timeout setter callback is required");
     ESP_RETURN_ON_FALSE(context->get_firmware_status != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "Firmware status callback is required");
     ESP_RETURN_ON_FALSE(context->check_firmware_update != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -1777,6 +2046,3 @@ void router_web_stop(httpd_handle_t server)
         httpd_stop(server);
     }
 }
-
-
-

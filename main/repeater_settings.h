@@ -8,6 +8,8 @@
 
 #define REPEATER_MAC_STRING_LEN 18
 #define REPEATER_DEVICE_DESCRIPTION_MAX_LEN 48
+#define REPEATER_CLIENT_HOSTNAME_MAX_LEN 63
+#define REPEATER_CLIENT_LOCAL_IP_MAX_LEN 15
 #define REPEATER_WIFI_SSID_MAX_LEN 32
 #define REPEATER_WIFI_PASSWORD_MAX_LEN 63
 #define REPEATER_WEB_AUTH_USERNAME_MAX_LEN 32
@@ -46,6 +48,7 @@ typedef struct {
     char ssid[REPEATER_WIFI_SSID_MAX_LEN + 1];
     char password[REPEATER_WIFI_PASSWORD_MAX_LEN + 1];
     wifi_auth_mode_t auth_mode;
+    bool ssid_hidden;
 } repeater_softap_config_t;
 
 typedef struct {
@@ -61,6 +64,8 @@ typedef struct {
 typedef struct {
     char mac[REPEATER_MAC_STRING_LEN];
     char description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
+    char hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
+    char last_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
     int64_t first_seen_epoch;
     int64_t last_seen_epoch;
 } repeater_client_history_entry_t;
@@ -70,8 +75,13 @@ esp_err_t repeater_settings_factory_reset(void);
 esp_err_t repeater_settings_apply(void);
 esp_err_t repeater_settings_set_signal_level_by_token(const char *token);
 esp_err_t repeater_settings_set_theme_by_token(const char *token);
+bool repeater_settings_is_status_led_enabled(void);
+esp_err_t repeater_settings_set_status_led_enabled(bool enabled);
 esp_err_t repeater_settings_set_auto_reboot_config(bool enabled, uint8_t hour, uint8_t minute);
+esp_err_t repeater_settings_set_failsafe_reboot_timeout_minutes(uint8_t timeout_minutes);
 esp_err_t repeater_settings_record_client_connection(const char *mac);
+esp_err_t repeater_settings_set_client_hostname(const char *mac, const char *hostname);
+esp_err_t repeater_settings_set_client_last_local_ip(const char *mac, const char *local_ip);
 esp_err_t repeater_settings_set_device_description(const char *mac, const char *description);
 esp_err_t repeater_settings_set_wifi_networks(const char *primary_station_ssid,
                                               const char *primary_station_password,
@@ -79,7 +89,8 @@ esp_err_t repeater_settings_set_wifi_networks(const char *primary_station_ssid,
                                               const char *backup_station_password,
                                               const char *softap_ssid,
                                               const char *softap_password,
-                                              const char *softap_auth_token);
+                                              const char *softap_auth_token,
+                                              bool softap_ssid_hidden);
 esp_err_t repeater_settings_set_web_auth(const char *username, const char *password);
 
 const char *repeater_settings_get_signal_level_label(void);
@@ -98,6 +109,7 @@ size_t repeater_settings_get_softap_auth_option_count(void);
 
 bool repeater_settings_is_auto_reboot_enabled(void);
 repeater_auto_reboot_config_t repeater_settings_get_auto_reboot_config(void);
+uint8_t repeater_settings_get_failsafe_reboot_timeout_minutes(void);
 size_t repeater_settings_get_client_history(repeater_client_history_entry_t *entries, size_t max_entries);
 const char *repeater_settings_get_device_description(const char *mac);
 const repeater_station_config_t *repeater_settings_get_station_config(void);

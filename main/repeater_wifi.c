@@ -23,10 +23,13 @@
 #endif
 #include "lwip/sys.h"
 #include "project_wifi_config.h"
+#include "repeater_dhcp_hostnames.h"
 #include "repeater_settings.h"
 #include "repeater_wifi.h"
 
 #define DHCPS_OFFER_DNS 0x02
+#define SOFTAP_FALLBACK_DNS_MAIN_ADDR   ESP_IP4TOADDR(1, 1, 1, 1)
+#define SOFTAP_FALLBACK_DNS_BACKUP_ADDR ESP_IP4TOADDR(8, 8, 8, 8)
 
 static const char *TAG = "RepeaterWiFi";
 static const char *TAG_AP = "RepeaterAP";
@@ -34,9 +37,20 @@ static const char *TAG_STA = "RepeaterSTA";
 static repeater_runtime_t *s_runtime;
 static esp_timer_handle_t s_sta_reconnect_timer;
 
+typedef enum {
+    REPEATER_UPSTREAM_PROBE_OFFLINE = 0,
+    REPEATER_UPSTREAM_PROBE_ONLINE,
+} repeater_upstream_probe_result_t;
 static bool repeater_wifi_is_using_backup_profile(void);
 static const char *repeater_wifi_get_station_role_name(bool use_backup);
 static const char *repeater_wifi_get_upstream_ssid(void);
+static bool repeater_wifi_station_profile_is_configured(bool use_backup);
+static bool repeater_dns_info_has_ipv4_address(const esp_netif_dns_info_t *dns);
+static void repeater_fill_dns_info_ipv4(esp_netif_dns_info_t *dns, uint32_t ipv4_addr);
+static void repeater_apply_softap_dns_servers(esp_netif_dns_info_t *main_dns,
+                                              esp_netif_dns_info_t *backup_dns,
+                                              const char *source_label);
+static void repeater_apply_softap_fallback_dns(void);
 
 static bool repeater_wifi_is_system_time_valid(time_t now)
 {
@@ -101,8 +115,15 @@ static void repeater_wifi_reconnect_timer_cb(void *arg)
         return;
     }
 
+    const bool use_backup = repeater_wifi_is_using_backup_profile();
+    if (!repeater_wifi_station_profile_is_configured(use_backup)) {
+        ESP_LOGW(TAG_STA, "Skipping upstream connect: %s profile SSID is empty",
+                 repeater_wifi_get_station_role_name(use_backup));
+        return;
+    }
+
     ESP_LOGI(TAG_STA, "Attempting upstream connection to %s SSID: %s",
-             repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
+             repeater_wifi_get_station_role_name(use_backup),
              repeater_wifi_get_upstream_ssid());
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
 }
@@ -126,8 +147,16 @@ static esp_err_t repeater_wifi_ensure_reconnect_timer(void)
 
 static void repeater_wifi_schedule_reconnect(bool initial_attempt)
 {
+    const bool use_backup = repeater_wifi_is_using_backup_profile();
     const uint32_t delay_ms = repeater_wifi_get_reconnect_delay_ms(initial_attempt,
                                                                    s_runtime != NULL ? s_runtime->retry_count : 0);
+
+    if (!repeater_wifi_station_profile_is_configured(use_backup)) {
+        repeater_wifi_cancel_scheduled_reconnect();
+        ESP_LOGW(TAG_STA, "Upstream %s SSID is empty, staying in SoftAP-only standby",
+                 repeater_wifi_get_station_role_name(use_backup));
+        return;
+    }
 
     if (repeater_wifi_ensure_reconnect_timer() != ESP_OK) {
         ESP_LOGW(TAG_STA, "Reconnect timer unavailable, connecting immediately");
@@ -139,7 +168,7 @@ static void repeater_wifi_schedule_reconnect(bool initial_attempt)
     ESP_LOGI(TAG_STA, "%s upstream connect scheduled in %lu ms for %s SSID: %s",
              initial_attempt ? "Initial" : "Retry",
              (unsigned long)delay_ms,
-             repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
+             repeater_wifi_get_station_role_name(use_backup),
              repeater_wifi_get_upstream_ssid());
 
     if (delay_ms == 0) {
@@ -261,6 +290,17 @@ static bool repeater_wifi_timeout_expired(int64_t started_at_monotonic_us, int64
         repeater_wifi_elapsed_ms_since(started_at_monotonic_us, now_monotonic_us) >= timeout_ms;
 }
 
+static int64_t repeater_wifi_get_failsafe_reboot_timeout_ms(void)
+{
+    const uint8_t timeout_minutes = repeater_settings_get_failsafe_reboot_timeout_minutes();
+
+    if (timeout_minutes == 0) {
+        return 0;
+    }
+
+    return (int64_t)timeout_minutes * 60LL * 1000LL;
+}
+
 static void repeater_wifi_restart_like_power_cycle(const char *reason)
 {
     ESP_LOGE(TAG, "Failsafe reboot requested: %s", reason != NULL ? reason : "unknown reason");
@@ -302,6 +342,14 @@ static const repeater_station_config_t *repeater_wifi_get_station_config(void)
     return repeater_wifi_get_station_config_for_profile(repeater_wifi_is_using_backup_profile());
 }
 
+static bool repeater_wifi_station_profile_is_configured(bool use_backup)
+{
+    const repeater_station_config_t *station_config =
+        repeater_wifi_get_station_config_for_profile(use_backup);
+
+    return station_config != NULL && station_config->ssid[0] != '\0';
+}
+
 static const repeater_softap_config_t *repeater_wifi_get_softap_config(void)
 {
     return repeater_settings_get_softap_config();
@@ -333,6 +381,20 @@ static void repeater_wifi_failsafe_reboot_task(void *arg)
 
         if (PROJECT_FAILSAFE_REBOOT_ENABLED && s_runtime != NULL) {
             const int active_client_count = repeater_wifi_refresh_active_client_count();
+            const int64_t failsafe_timeout_ms = repeater_wifi_get_failsafe_reboot_timeout_ms();
+
+            if (failsafe_timeout_ms <= 0) {
+                repeater_wifi_clear_timeout_window(&s_runtime->upstream_unavailable_since_monotonic_us);
+                repeater_wifi_clear_timeout_window(&s_runtime->no_client_since_monotonic_us);
+                vTaskDelay(pdMS_TO_TICKS(PROJECT_FAILSAFE_REBOOT_CHECK_INTERVAL_MS));
+                continue;
+            }
+
+            if (s_runtime->sta_has_upstream_connection) {
+                repeater_wifi_clear_timeout_window(&s_runtime->upstream_unavailable_since_monotonic_us);
+            } else {
+                repeater_wifi_begin_timeout_window(&s_runtime->upstream_unavailable_since_monotonic_us);
+            }
 
             if (active_client_count > 0) {
                 repeater_wifi_clear_timeout_window(&s_runtime->no_client_since_monotonic_us);
@@ -341,21 +403,21 @@ static void repeater_wifi_failsafe_reboot_task(void *arg)
             }
 
             if (repeater_wifi_timeout_expired(s_runtime->upstream_unavailable_since_monotonic_us,
-                                              PROJECT_FAILSAFE_REBOOT_TIMEOUT_MS,
+                                              failsafe_timeout_ms,
                                               now_monotonic_us)) {
                 const int64_t elapsed_ms = repeater_wifi_elapsed_ms_since(
                     s_runtime->upstream_unavailable_since_monotonic_us, now_monotonic_us);
 
                 ESP_LOGE(TAG_STA,
-                         "No upstream IP for %lld ms on %s SSID=%s, forcing reboot",
+                         "No upstream internet for %lld ms on %s SSID=%s, forcing reboot",
                          elapsed_ms,
                          repeater_wifi_get_station_role_name(repeater_wifi_is_using_backup_profile()),
                          repeater_wifi_get_upstream_ssid());
-                repeater_wifi_restart_like_power_cycle("upstream unavailable for too long");
+                repeater_wifi_restart_like_power_cycle("upstream internet unavailable for too long");
             }
 
             if (repeater_wifi_timeout_expired(s_runtime->no_client_since_monotonic_us,
-                                              PROJECT_FAILSAFE_REBOOT_TIMEOUT_MS,
+                                              failsafe_timeout_ms,
                                               now_monotonic_us)) {
                 const int64_t elapsed_ms = repeater_wifi_elapsed_ms_since(
                     s_runtime->no_client_since_monotonic_us, now_monotonic_us);
@@ -495,6 +557,12 @@ static const char *wifi_disconnect_reason_detail(uint8_t reason)
     }
 }
 
+static bool repeater_wifi_auth_mode_uses_wpa3(wifi_auth_mode_t auth_mode)
+{
+    return auth_mode == WIFI_AUTH_WPA3_PSK ||
+        auth_mode == WIFI_AUTH_WPA2_WPA3_PSK;
+}
+
 static const char *wifi_auth_mode_to_str(wifi_auth_mode_t auth_mode)
 {
     switch (auth_mode) {
@@ -579,6 +647,7 @@ static void repeater_update_internet_status(bool has_internet)
         ESP_LOGW(TAG_STA, "Upstream internet access lost");
     }
 }
+
 
 static esp_err_t repeater_apply_station_config_for_profile(bool use_backup, bool reconnect_now)
 {
@@ -715,6 +784,10 @@ size_t repeater_wifi_get_clients(repeater_client_info_t *clients, size_t max_cli
         snprintf(clients[count].mac, sizeof(clients[count].mac), "%s", history[i].mac);
         snprintf(clients[count].description, sizeof(clients[count].description), "%s",
                  history[i].description);
+        snprintf(clients[count].hostname, sizeof(clients[count].hostname), "%s",
+                 history[i].hostname);
+        snprintf(clients[count].last_local_ip, sizeof(clients[count].last_local_ip), "%s",
+                 history[i].last_local_ip);
         clients[count].rssi = 0;
         clients[count].is_connected = false;
         clients[count].first_seen_epoch = history[i].first_seen_epoch;
@@ -748,6 +821,8 @@ size_t repeater_wifi_get_clients(repeater_client_info_t *clients, size_t max_cli
             snprintf(clients[count].mac, sizeof(clients[count].mac), "%s", normalized_mac);
             snprintf(clients[count].description, sizeof(clients[count].description), "%s",
                      repeater_settings_get_device_description(normalized_mac));
+            clients[count].hostname[0] = '\0';
+            clients[count].last_local_ip[0] = '\0';
             clients[count].first_seen_epoch = 0;
             clients[count].last_seen_epoch = 0;
             ++count;
@@ -763,37 +838,28 @@ size_t repeater_wifi_get_clients(repeater_client_info_t *clients, size_t max_cli
 
 static void repeater_update_softap_dns(void)
 {
-    esp_netif_dns_info_t dns;
-    uint8_t dns_offer = DHCPS_OFFER_DNS;
-    esp_err_t err = esp_netif_get_dns_info(s_runtime->sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+    esp_netif_dns_info_t main_dns;
+    esp_netif_dns_info_t backup_dns;
+    esp_err_t main_err;
+    esp_err_t backup_err;
 
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG_AP, "Failed to get DNS from upstream station: %s", esp_err_to_name(err));
+    memset(&main_dns, 0, sizeof(main_dns));
+    memset(&backup_dns, 0, sizeof(backup_dns));
+
+    main_err = esp_netif_get_dns_info(s_runtime->sta_netif, ESP_NETIF_DNS_MAIN, &main_dns);
+    if (main_err != ESP_OK || !repeater_dns_info_has_ipv4_address(&main_dns)) {
+        ESP_LOGW(TAG_AP, "Upstream main DNS unavailable, using fallback resolvers: %s",
+                 main_err == ESP_OK ? "empty IPv4 DNS address" : esp_err_to_name(main_err));
+        repeater_apply_softap_fallback_dns();
         return;
     }
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(s_runtime->ap_netif));
-
-    err = esp_netif_dhcps_option(s_runtime->ap_netif, ESP_NETIF_OP_SET,
-                                 ESP_NETIF_DOMAIN_NAME_SERVER, &dns_offer, sizeof(dns_offer));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_AP, "Failed to enable DNS offer on SoftAP DHCP: %s", esp_err_to_name(err));
-        return;
+    backup_err = esp_netif_get_dns_info(s_runtime->sta_netif, ESP_NETIF_DNS_BACKUP, &backup_dns);
+    if (backup_err != ESP_OK || !repeater_dns_info_has_ipv4_address(&backup_dns)) {
+        repeater_fill_dns_info_ipv4(&backup_dns, SOFTAP_FALLBACK_DNS_BACKUP_ADDR);
     }
 
-    err = esp_netif_set_dns_info(s_runtime->ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_AP, "Failed to copy upstream DNS to SoftAP DHCP: %s", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_netif_dhcps_start(s_runtime->ap_netif);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_AP, "Failed to restart SoftAP DHCP server: %s", esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGI(TAG_AP, "SoftAP DHCP DNS updated from upstream station");
+    repeater_apply_softap_dns_servers(&main_dns, &backup_dns, "upstream station");
 }
 
 static void repeater_enable_napt(void)
@@ -822,6 +888,80 @@ static void repeater_enable_napt(void)
 #endif
 }
 
+static bool repeater_dns_info_has_ipv4_address(const esp_netif_dns_info_t *dns)
+{
+    return dns != NULL &&
+        dns->ip.type == ESP_IPADDR_TYPE_V4 &&
+        dns->ip.u_addr.ip4.addr != 0;
+}
+
+static void repeater_fill_dns_info_ipv4(esp_netif_dns_info_t *dns, uint32_t ipv4_addr)
+{
+    if (dns == NULL) {
+        return;
+    }
+
+    memset(dns, 0, sizeof(*dns));
+    dns->ip.type = ESP_IPADDR_TYPE_V4;
+    dns->ip.u_addr.ip4.addr = ipv4_addr;
+}
+
+static void repeater_apply_softap_dns_servers(esp_netif_dns_info_t *main_dns,
+                                              esp_netif_dns_info_t *backup_dns,
+                                              const char *source_label)
+{
+    uint8_t dns_offer = DHCPS_OFFER_DNS;
+    esp_err_t err = esp_netif_dhcps_stop(s_runtime->ap_netif);
+
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGW(TAG_AP, "Failed to stop SoftAP DHCP server before DNS update: %s",
+                 esp_err_to_name(err));
+    }
+
+    err = esp_netif_dhcps_option(s_runtime->ap_netif, ESP_NETIF_OP_SET,
+                                 ESP_NETIF_DOMAIN_NAME_SERVER, &dns_offer, sizeof(dns_offer));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_AP, "Failed to enable DNS offer on SoftAP DHCP: %s", esp_err_to_name(err));
+        goto restart_dhcps;
+    }
+
+    if (main_dns != NULL) {
+        err = esp_netif_set_dns_info(s_runtime->ap_netif, ESP_NETIF_DNS_MAIN, main_dns);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_AP, "Failed to set main SoftAP DNS: %s", esp_err_to_name(err));
+            goto restart_dhcps;
+        }
+    }
+
+    if (backup_dns != NULL) {
+        err = esp_netif_set_dns_info(s_runtime->ap_netif, ESP_NETIF_DNS_BACKUP, backup_dns);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_AP, "Failed to set backup SoftAP DNS: %s", esp_err_to_name(err));
+            goto restart_dhcps;
+        }
+    }
+
+    ESP_LOGI(TAG_AP, "SoftAP DHCP DNS updated from %s",
+             source_label != NULL ? source_label : "configured servers");
+
+restart_dhcps:
+    err = esp_netif_dhcps_start(s_runtime->ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGE(TAG_AP, "Failed to restart SoftAP DHCP server: %s", esp_err_to_name(err));
+    }
+}
+
+static void repeater_apply_softap_fallback_dns(void)
+{
+    esp_netif_dns_info_t main_dns;
+    esp_netif_dns_info_t backup_dns;
+
+    repeater_fill_dns_info_ipv4(&main_dns, SOFTAP_FALLBACK_DNS_MAIN_ADDR);
+    repeater_fill_dns_info_ipv4(&backup_dns, SOFTAP_FALLBACK_DNS_BACKUP_ADDR);
+    repeater_apply_softap_dns_servers(&main_dns, &backup_dns, "fallback resolvers");
+}
+
+
 static void repeater_handle_upstream_ready(const ip_event_got_ip_t *event)
 {
     esp_err_t err = esp_netif_set_default_netif(s_runtime->sta_netif);
@@ -833,7 +973,6 @@ static void repeater_handle_upstream_ready(const ip_event_got_ip_t *event)
     ESP_LOGI(TAG_STA, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
     ESP_LOGI(TAG_STA, "Gateway:" IPSTR " Netmask:" IPSTR,
              IP2STR(&event->ip_info.gw), IP2STR(&event->ip_info.netmask));
-
     repeater_update_softap_dns();
     repeater_enable_napt();
 }
@@ -940,8 +1079,15 @@ static void repeater_wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
         const ip_event_ap_staipassigned_t *event = (const ip_event_ap_staipassigned_t *)event_data;
         char mac_text[REPEATER_MAC_STRING_LEN];
+        char local_ip_text[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
+        char hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
 
         repeater_wifi_format_mac_uppercase(mac_text, sizeof(mac_text), event->mac);
+        snprintf(local_ip_text, sizeof(local_ip_text), IPSTR, IP2STR(&event->ip));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(repeater_settings_set_client_last_local_ip(mac_text, local_ip_text));
+        if (repeater_dhcp_hostnames_get(mac_text, hostname, sizeof(hostname))) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(repeater_settings_set_client_hostname(mac_text, hostname));
+        }
         ESP_LOGI(TAG_AP, "Assigned IP to SoftAP client: " IPSTR ", MAC=%s",
                  IP2STR(&event->ip), mac_text);
     }
@@ -996,25 +1142,43 @@ static esp_err_t repeater_apply_softap_config(void)
 {
     wifi_config_t wifi_ap_config = { 0 };
     const repeater_softap_config_t *softap_config = repeater_wifi_get_softap_config();
+    const char *runtime_ssid = softap_config->ssid;
+    const char *runtime_password = softap_config->password;
+    wifi_auth_mode_t runtime_auth_mode = softap_config->auth_mode;
+    bool runtime_ssid_hidden = softap_config->ssid_hidden;
 
-    wifi_ap_config.ap.ssid_len = strlen(softap_config->ssid);
-    memcpy(wifi_ap_config.ap.ssid, softap_config->ssid, wifi_ap_config.ap.ssid_len);
+    if (runtime_ssid[0] == '\0') {
+        runtime_ssid = PROJECT_WIFI_AP_SSID;
+        runtime_password = PROJECT_WIFI_AP_PASSWORD;
+        runtime_auth_mode = PROJECT_WIFI_AP_AUTH_MODE;
+        runtime_ssid_hidden = PROJECT_WIFI_AP_SSID_HIDDEN;
+        ESP_LOGW(TAG_AP, "Saved SoftAP SSID is empty, applying default SoftAP settings at runtime");
+    }
+
+    const bool use_wpa3 = repeater_wifi_auth_mode_uses_wpa3(runtime_auth_mode);
+
+    wifi_ap_config.ap.ssid_len = strlen(runtime_ssid);
+    memcpy(wifi_ap_config.ap.ssid, runtime_ssid, wifi_ap_config.ap.ssid_len);
     wifi_ap_config.ap.channel = PROJECT_WIFI_AP_CHANNEL;
     snprintf((char *)wifi_ap_config.ap.password, sizeof(wifi_ap_config.ap.password), "%s",
-             softap_config->password);
+             runtime_password);
     wifi_ap_config.ap.max_connection = PROJECT_WIFI_AP_MAX_STA_CONN;
-    wifi_ap_config.ap.ssid_hidden = 0;
+    wifi_ap_config.ap.ssid_hidden = runtime_ssid_hidden ? 1 : 0;
     wifi_ap_config.ap.beacon_interval = 100;
-    wifi_ap_config.ap.authmode = softap_config->auth_mode == WIFI_AUTH_OPEN
+    wifi_ap_config.ap.authmode = runtime_auth_mode == WIFI_AUTH_OPEN
         ? WIFI_AUTH_OPEN
-        : softap_config->auth_mode;
-    wifi_ap_config.ap.pmf_cfg.required = false;
+        : runtime_auth_mode;
+    wifi_ap_config.ap.pmf_cfg.required = use_wpa3;
+    if (use_wpa3) {
+        wifi_ap_config.ap.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    }
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config), TAG_AP,
                         "Failed to configure SoftAP");
 
-    ESP_LOGI(TAG_AP, "SoftAP configured. SSID=%s channel=%d (%s) max_clients=%d",
-             softap_config->ssid, PROJECT_WIFI_AP_CHANNEL,
+    ESP_LOGI(TAG_AP, "SoftAP configured. SSID=%s visibility=%s channel=%d (%s) max_clients=%d",
+             runtime_ssid, runtime_ssid_hidden ? "hidden" : "visible",
+             PROJECT_WIFI_AP_CHANNEL,
              repeater_wifi_get_softap_channel_label(), PROJECT_WIFI_AP_MAX_STA_CONN);
     ESP_LOGI(TAG_AP, "SoftAP security mode: %s",
              wifi_auth_mode_to_str(wifi_ap_config.ap.authmode));
@@ -1072,6 +1236,7 @@ esp_err_t repeater_wifi_start(repeater_runtime_t *runtime)
     ESP_RETURN_ON_ERROR(repeater_init_softap(), TAG, "Failed to initialize SoftAP");
     ESP_RETURN_ON_ERROR(repeater_init_station(), TAG, "Failed to initialize station");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start Wi-Fi");
+    repeater_apply_softap_fallback_dns();
     ESP_RETURN_ON_ERROR(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20), TAG_AP,
                         "Failed to set SoftAP bandwidth");
     ESP_RETURN_ON_ERROR(repeater_settings_apply(), TAG,
@@ -1121,6 +1286,37 @@ esp_err_t repeater_wifi_get_upstream_ip_info(const repeater_runtime_t *runtime,
     return esp_netif_get_ip_info(runtime->sta_netif, out_ip_info);
 }
 
+esp_err_t repeater_wifi_get_upstream_rssi(const repeater_runtime_t *runtime, int *out_rssi)
+{
+    wifi_ap_record_t ap_info;
+
+    ESP_RETURN_ON_FALSE(runtime != NULL, ESP_ERR_INVALID_ARG, TAG, "Runtime is required");
+    ESP_RETURN_ON_FALSE(out_rssi != NULL, ESP_ERR_INVALID_ARG, TAG, "RSSI output is required");
+
+    memset(&ap_info, 0, sizeof(ap_info));
+    ESP_RETURN_ON_ERROR(esp_wifi_sta_get_ap_info(&ap_info), TAG,
+                        "Failed to read upstream AP information");
+
+    *out_rssi = ap_info.rssi;
+    return ESP_OK;
+}
+
+esp_err_t repeater_wifi_get_upstream_channel(const repeater_runtime_t *runtime, int *out_channel)
+{
+    wifi_ap_record_t ap_info;
+
+    ESP_RETURN_ON_FALSE(runtime != NULL, ESP_ERR_INVALID_ARG, TAG, "Runtime is required");
+    ESP_RETURN_ON_FALSE(out_channel != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "Channel output is required");
+
+    memset(&ap_info, 0, sizeof(ap_info));
+    ESP_RETURN_ON_ERROR(esp_wifi_sta_get_ap_info(&ap_info), TAG,
+                        "Failed to read upstream AP information");
+
+    *out_channel = ap_info.primary;
+    return ESP_OK;
+}
+
 esp_err_t repeater_wifi_read_softap_mac(char *out_mac, size_t out_mac_size)
 {
     uint8_t ap_mac[6];
@@ -1144,6 +1340,7 @@ bool repeater_wifi_is_using_backup_upstream(const repeater_runtime_t *runtime)
 {
     return runtime != NULL && runtime->sta_using_backup_connection && repeater_wifi_has_backup_station();
 }
+
 
 const char *repeater_wifi_get_active_upstream_ssid(const repeater_runtime_t *runtime)
 {
@@ -1209,8 +1406,3 @@ int repeater_wifi_get_client_count(const repeater_runtime_t *runtime)
 
     return runtime->ap_client_count;
 }
-
-
-
-
-

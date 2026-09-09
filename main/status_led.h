@@ -4,6 +4,7 @@
 #include "esp_err.h"
 
 typedef struct {
+    bool (*is_enabled)(void);
     bool (*is_upstream_connected)(void);
     int (*get_client_count)(void);
 } status_led_context_t;
