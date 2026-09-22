@@ -1,6 +1,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_event.h"
+#include "esp_log.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
@@ -15,6 +16,8 @@ static void storage_init(void)
     esp_err_t err = nvs_flash_init();
 
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW("Storage", "NVS initialization failed (%s); erasing NVS to recover. "
+                 "Saved settings and client history will be reset", esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }

@@ -5,7 +5,7 @@
 
 /* Project metadata */
 #define PROJECT_DEVICE_NAME                 "B-T WiFi repeater"
-#define PROJECT_FIRMWARE_VERSION            "1.0.7"
+#define PROJECT_FIRMWARE_VERSION            "1.0.8"
 #define PROJECT_WIFI_STA_HOSTNAME           "BUCO-TECH"
 #define PROJECT_BRAND_COLOR_HEX             "#1146A6"
 #define PROJECT_WEB_FONT_STACK              "'Avenir Next','Trebuchet MS','Segoe UI',sans-serif"

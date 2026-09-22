@@ -14,6 +14,18 @@
 static const char *TAG = "RouterWeb";
 static router_web_context_t s_context_storage;
 static const router_web_context_t *s_context = &s_context_storage;
+/* Shared by the dashboard and all action result pages. */
+static const char ROUTER_WEB_THEME_CSS[] =
+    ":root{color-scheme:light;"
+    "--bg:#f6efe5;--bg-deep:#dfe8fb;--panel:rgba(255,255,255,.82);--panel-strong:#ffffff;--panel-alt:rgba(244,247,252,.86);"
+    "--text:#18212f;--muted:#667085;--border:rgba(95,118,148,.18);--accent:#1f6feb;--accent-strong:" PROJECT_BRAND_COLOR_HEX ";--accent-text:#ffffff;"
+    "--success:#168252;--danger:#d33d2f;--warning:#c26a12;--shadow:0 24px 60px rgba(26,39,68,.12);--shadow-soft:0 12px 28px rgba(26,39,68,.08);"
+    "--font-main:" PROJECT_WEB_FONT_STACK ";--radius:24px;--radius-sm:18px;--line-copy:1.5;}"
+    "html[data-theme='dark']{color-scheme:dark;"
+    "--bg:#09111f;--bg-deep:#13213a;--panel:rgba(12,22,38,.84);--panel-strong:#14233d;--panel-alt:rgba(20,35,61,.88);"
+    "--text:#edf2fb;--muted:#9ab0cf;--border:rgba(151,174,207,.16);--accent:#7dc1ff;--accent-strong:#4f9eff;--accent-text:#08101d;"
+    "--success:#53d39a;--danger:#ff8578;--warning:#ffbf66;--shadow:0 24px 60px rgba(0,0,0,.32);--shadow-soft:0 12px 28px rgba(0,0,0,.18);}";
+
 static const char ROUTER_WEB_FAVICON_SVG[] =
     "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
     "<rect width='64' height='64' rx='16' fill='#ffffff'/>"
@@ -855,15 +867,7 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>" PROJECT_DEVICE_NAME "</title>"
         "<style>"
-        ":root{color-scheme:light;"
-        "--bg:#f6efe5;--bg-deep:#dfe8fb;--panel:rgba(255,255,255,.82);--panel-strong:#ffffff;--panel-alt:rgba(244,247,252,.86);"
-        "--text:#18212f;--muted:#667085;--border:rgba(95,118,148,.18);--accent:#1f6feb;--accent-strong:" PROJECT_BRAND_COLOR_HEX ";--accent-text:#ffffff;"
-        "--success:#168252;--danger:#d33d2f;--warning:#c26a12;--shadow:0 24px 60px rgba(26,39,68,.12);--shadow-soft:0 12px 28px rgba(26,39,68,.08);"
-        "--font-main:" PROJECT_WEB_FONT_STACK ";--radius:24px;--radius-sm:18px;--line-copy:1.5;}"
-        "html[data-theme='dark']{color-scheme:dark;"
-        "--bg:#09111f;--bg-deep:#13213a;--panel:rgba(12,22,38,.84);--panel-strong:#14233d;--panel-alt:rgba(20,35,61,.88);"
-        "--text:#edf2fb;--muted:#9ab0cf;--border:rgba(151,174,207,.16);--accent:#7dc1ff;--accent-strong:#4f9eff;--accent-text:#08101d;"
-        "--success:#53d39a;--danger:#ff8578;--warning:#ffbf66;--shadow:0 24px 60px rgba(0,0,0,.32);--shadow-soft:0 12px 28px rgba(0,0,0,.18);}"
+        "%s"
         "*{box-sizing:border-box;font-family:var(--font-main);}"
         "html,body{margin:0;min-height:100vh;}"
         "body{background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 32%%),radial-gradient(circle at top right,rgba(125,193,255,.18),transparent 28%%),linear-gradient(155deg,var(--bg),var(--bg-deep));color:var(--text);line-height:var(--line-copy);}"
@@ -1085,6 +1089,7 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "</main>"
         "</body></html>",
         s_context->get_theme_token(),
+        ROUTER_WEB_THEME_CSS,
         upstream_status_class,
         upstream_status_text,
         active_upstream_role,
@@ -1185,31 +1190,33 @@ static void preserve_existing_secret_if_blank(const char *submitted_identity,
 static esp_err_t send_success_page(httpd_req_t *req, const char *title,
                                    const char *summary, const char *note_html)
 {
-    char html[3072];
+    char html[3072 + sizeof(ROUTER_WEB_THEME_CSS)];
     const char *safe_title = title != NULL ? title : "Saved";
     const char *safe_summary = summary != NULL ? summary : "";
     const char *safe_note_html = note_html != NULL ? note_html : "";
     int written = snprintf(
         html, sizeof(html),
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\">"
+        "<html data-theme=\"%s\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>%s</title>"
         "<style>"
-        "body{margin:0;font-family:" PROJECT_WEB_FONT_STACK ";background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
-        ".card{max-width:560px;width:100%%;background:rgba(255,255,255,.88);border:1px solid rgba(95,118,148,.18);border-radius:28px;padding:28px;box-shadow:0 24px 60px rgba(26,39,68,.12);backdrop-filter:blur(18px);}"
-        "h1{margin:0 0 12px;font-size:28px;line-height:1.1;}p{margin:0 0 12px;color:#667085;font-size:14px;}"
-        ".note{padding:18px;border:1px solid rgba(95,118,148,.18);border-radius:20px;background:rgba(244,247,252,.9);margin:18px 0;}"
+        "%s"
+        "body{margin:0;font-family:var(--font-main);background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,var(--bg),var(--bg-deep));color:var(--text);display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
+        ".card{max-width:560px;width:100%%;background:var(--panel);border:1px solid var(--border);border-radius:28px;padding:28px;box-shadow:var(--shadow);backdrop-filter:blur(18px);}"
+        "h1{margin:0 0 12px;font-size:28px;line-height:1.1;}p{margin:0 0 12px;color:var(--muted);font-size:14px;}"
+        ".note{padding:18px;border:1px solid var(--border);border-radius:20px;background:var(--panel-alt);margin:18px 0;}"
         ".note p:last-child{margin-bottom:0;}"
-        ".action{display:inline-block;margin-top:4px;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb," PROJECT_BRAND_COLOR_HEX ");color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
+        ".action{display:inline-block;margin-top:4px;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:var(--accent-text);text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
         "</style></head><body><main class=\"card\">"
         "<h1>%s</h1>"
         "<p>%s</p>"
         "<div class=\"note\">%s</div>"
         "<a class=\"action\" href=\"/\">Open home page</a>"
         "</main></body></html>",
-        safe_title, safe_title, safe_summary, safe_note_html);
+        s_context->get_theme_token(), safe_title, ROUTER_WEB_THEME_CSS,
+        safe_title, safe_summary, safe_note_html);
 
     if (written < 0 || written >= (int)sizeof(html)) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -1269,7 +1276,7 @@ static esp_err_t send_firmware_action_page(httpd_req_t *req, const char *title,
     char escaped_current_version[ROUTER_WEB_ESCAPED_FIRMWARE_VERSION_BUFFER_SIZE];
     char escaped_available_version[ROUTER_WEB_ESCAPED_FIRMWARE_VERSION_BUFFER_SIZE];
     char escaped_status_message[ROUTER_WEB_ESCAPED_FIRMWARE_MESSAGE_BUFFER_SIZE];
-    char html[4096];
+    char html[4096 + sizeof(ROUTER_WEB_THEME_CSS)];
     const char *safe_title = title != NULL ? title : "Firmware Update";
     const char *safe_summary = summary != NULL ? summary : "";
     const char *safe_current_version =
@@ -1297,19 +1304,20 @@ static esp_err_t send_firmware_action_page(httpd_req_t *req, const char *title,
     int written = snprintf(
         html, sizeof(html),
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\">"
+        "<html data-theme=\"%s\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/svg+xml\">"
         "<title>%s</title>"
         "<style>"
-        "body{margin:0;font-family:" PROJECT_WEB_FONT_STACK ";background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,#f6efe5,#dfe8fb);color:#18212f;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
-        ".card{max-width:680px;width:100%%;background:rgba(255,255,255,.88);border:1px solid rgba(95,118,148,.18);border-radius:28px;padding:28px;display:grid;gap:16px;box-shadow:0 24px 60px rgba(26,39,68,.12);backdrop-filter:blur(18px);}"
-        "h1{margin:0;font-size:28px;line-height:1.1;}p{margin:0;color:#667085;font-size:14px;}"
-        ".badge{display:inline-flex;align-items:center;width:max-content;padding:6px 12px;border-radius:999px;background:rgba(31,111,235,.1);color:" PROJECT_BRAND_COLOR_HEX ";font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;}"
-        ".note{padding:18px;border:1px solid rgba(95,118,148,.18);border-radius:20px;background:rgba(244,247,252,.9);display:grid;gap:8px;}"
+        "%s"
+        "body{margin:0;font-family:var(--font-main);background:radial-gradient(circle at top left,rgba(255,255,255,.75),transparent 34%%),linear-gradient(155deg,var(--bg),var(--bg-deep));color:var(--text);display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;line-height:1.5;}"
+        ".card{max-width:680px;width:100%%;background:var(--panel);border:1px solid var(--border);border-radius:28px;padding:28px;display:grid;gap:16px;box-shadow:var(--shadow);backdrop-filter:blur(18px);}"
+        "h1{margin:0;font-size:28px;line-height:1.1;}p{margin:0;color:var(--muted);font-size:14px;}"
+        ".badge{display:inline-flex;align-items:center;width:max-content;padding:6px 12px;border-radius:999px;background:var(--panel-alt);color:var(--accent-strong);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;}"
+        ".note{padding:18px;border:1px solid var(--border);border-radius:20px;background:var(--panel-alt);display:grid;gap:8px;}"
         ".actions{display:flex;flex-wrap:wrap;gap:12px;}"
-        ".action{display:inline-block;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,#1f6feb," PROJECT_BRAND_COLOR_HEX ");color:#fff;text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
-        ".action.secondary{background:rgba(244,247,252,.95);color:#18212f;box-shadow:none;border:1px solid rgba(95,118,148,.18);}"
+        ".action{display:inline-block;padding:13px 18px;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:var(--accent-text);text-decoration:none;font-size:14px;font-weight:800;box-shadow:0 12px 24px rgba(17,70,166,.22);}"
+        ".action.secondary{background:var(--panel-alt);color:var(--text);box-shadow:none;border:1px solid var(--border);}"
         "</style></head><body><main class=\"card\">"
         "<span class=\"badge\">%s</span>"
         "<h1>%s</h1>"
@@ -1324,7 +1332,8 @@ static esp_err_t send_firmware_action_page(httpd_req_t *req, const char *title,
         "<a class=\"action secondary\" href=\"/\">Refresh status</a>"
         "</div>"
         "</main></body></html>",
-        safe_title, status_badge, safe_title, safe_summary, escaped_current_version,
+        s_context->get_theme_token(), safe_title, ROUTER_WEB_THEME_CSS,
+        status_badge, safe_title, safe_summary, escaped_current_version,
         escaped_available_version, escaped_status_message);
 
     if (written < 0 || written >= (int)sizeof(html)) {

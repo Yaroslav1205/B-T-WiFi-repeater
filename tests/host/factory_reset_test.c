@@ -14,7 +14,7 @@ typedef struct {
     size_t size;
 } entry_t;
 static entry_t saved[32], pending[32];
-static bool namespace_exists, fail_commit;
+static bool namespace_exists, fail_commit, fail_history_read;
 static unsigned int now_ms, press_ms, release_ms, commits, confirm_flashes;
 static bool led_on;
 
@@ -65,6 +65,7 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *data, s
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *data, size_t *size)
 {
     (void)handle;
+    if (fail_history_read && strcmp(key, "client_hist") == 0) return ESP_FAIL;
     entry_t *entry = find_entry(pending, key);
     if (!entry) return ESP_ERR_NVS_NOT_FOUND;
     if (data && *size < entry->size) return ESP_ERR_NVS_INVALID_LENGTH;
@@ -130,6 +131,174 @@ static void assert_defaults(void)
     assert(strcmp(repeater_settings_get_device_description("aa:bb:cc:dd:ee:ff"), "Keep me") == 0);
 }
 
+/* Byte fixtures reproduce the published ESP32 layouts, independently of the
+ * production disk structs. Old firmware always stored 64 slots of 88 bytes;
+ * 1.0.7 stored count slots of 168 bytes, also labelled version 1. */
+static unsigned char history_fixture[8 + 64 * 168 + 1];
+
+static size_t make_history_fixture(bool old_layout, uint8_t version, uint8_t count)
+{
+    memset(history_fixture, 0, sizeof(history_fixture));
+    history_fixture[0] = version;
+    history_fixture[1] = count;
+    for (size_t i = 0; i < count; ++i) {
+        unsigned char *entry = history_fixture + 8 + i * (old_layout ? 88 : 168);
+        snprintf((char *)entry, 18, "02:00:00:00:00:%02X", (unsigned int)i);
+        strcpy((char *)entry + 18, "Saved client");
+        if (!old_layout) {
+            strcpy((char *)entry + 67, "saved-host");
+            strcpy((char *)entry + 131, "192.168.4.10");
+        }
+        int64_t first = 1705000000 + (int64_t)i;
+        int64_t last = first + 100;
+        memcpy(entry + (old_layout ? 72 : 152), &first, 8);
+        memcpy(entry + (old_layout ? 80 : 160), &last, 8);
+    }
+    return old_layout ? 8 + 64 * 88 : 8 + (size_t)count * 168;
+}
+
+static void seed_history_fixture(size_t size)
+{
+    nvs_handle_t handle;
+    memset(saved, 0, sizeof(saved));
+    memset(pending, 0, sizeof(pending));
+    namespace_exists = false;
+    fail_commit = fail_history_read = false;
+    assert(nvs_open("repeater_cfg", NVS_READWRITE, &handle) == ESP_OK);
+    assert(nvs_set_blob(handle, "client_hist", history_fixture, size) == ESP_OK);
+    assert(nvs_commit(handle) == ESP_OK);
+    nvs_close(handle);
+    commits = 0;
+}
+
+static void assert_history_loaded(bool old_layout, size_t count)
+{
+    repeater_client_history_entry_t entries[64];
+    assert(repeater_settings_get_client_history(entries, 64) == count);
+    for (size_t i = 0; i < count; ++i) {
+        char mac[18];
+        snprintf(mac, sizeof(mac), "02:00:00:00:00:%02X", (unsigned int)i);
+        assert(strcmp(entries[i].mac, mac) == 0);
+        assert(strcmp(entries[i].description, "Saved client") == 0);
+        assert(strcmp(entries[i].hostname, old_layout ? "" : "saved-host") == 0);
+        assert(strcmp(entries[i].last_local_ip, old_layout ? "" : "192.168.4.10") == 0);
+        assert(entries[i].first_seen_epoch == 1705000000 + (int64_t)i);
+        assert(entries[i].last_seen_epoch == 1705000100 + (int64_t)i);
+    }
+}
+
+static void test_history_upgrade(bool old_layout, uint8_t version, uint8_t count)
+{
+    size_t size = make_history_fixture(old_layout, version, count);
+    seed_history_fixture(size);
+    assert(repeater_settings_init() == ESP_OK); /* First boot after OTA. */
+    assert_history_loaded(old_layout, count);
+    assert(commits == 0); /* Reading/migration does not destroy the old blob. */
+    assert(find_entry(saved, "client_hist")->size == size);
+    assert(memcmp(find_entry(saved, "client_hist")->data, history_fixture, size) == 0);
+
+    /* First write after OTA must keep every disconnected client. */
+    if (count < 64) {
+        assert(repeater_settings_record_client_connection("AA:BB:CC:DD:EE:FF") == ESP_OK);
+    } else {
+        assert(repeater_settings_record_client_connection("AA:BB:CC:DD:EE:FF") == ESP_ERR_NO_MEM);
+        assert(repeater_settings_set_device_description("02:00:00:00:00:00", "Saved client") == ESP_OK);
+    }
+    assert(find_entry(saved, "client_hist")->data[0] == 2);
+    assert(repeater_settings_init() == ESP_OK);
+    repeater_client_history_entry_t entries[64];
+    size_t expected = count < 64 ? count + 1 : count;
+    assert(repeater_settings_get_client_history(entries, 64) == expected);
+    for (size_t i = 0; i < count; ++i) {
+        assert(strcmp(entries[i].description, "Saved client") == 0);
+        assert(entries[i].first_seen_epoch == 1705000000 + (int64_t)i);
+        assert(entries[i].last_seen_epoch == 1705000100 + (int64_t)i);
+        assert(strcmp(entries[i].hostname, old_layout ? "" : "saved-host") == 0);
+        assert(strcmp(entries[i].last_local_ip, old_layout ? "" : "192.168.4.10") == 0);
+    }
+    assert(repeater_settings_factory_reset() == ESP_OK);
+    assert(repeater_settings_init() == ESP_OK);
+    assert(repeater_settings_get_client_history(entries, 64) == expected);
+}
+
+static void assert_unreadable_history_preserved(size_t size)
+{
+    seed_history_fixture(size);
+    assert(repeater_settings_init() == ESP_OK);
+    repeater_client_history_entry_t entries[64];
+    assert(repeater_settings_get_client_history(entries, 64) == 0);
+    for (int reset = 0; reset < 2; ++reset) {
+        assert(repeater_settings_record_client_connection("AA:BB:CC:DD:EE:FF") == ESP_ERR_INVALID_STATE);
+        assert(repeater_settings_set_client_hostname("AA:BB:CC:DD:EE:FF", "host") == ESP_ERR_INVALID_STATE);
+        assert(repeater_settings_set_client_last_local_ip("AA:BB:CC:DD:EE:FF", "192.168.4.2") == ESP_ERR_INVALID_STATE);
+        assert(repeater_settings_set_device_description("AA:BB:CC:DD:EE:FF", "label") == ESP_ERR_INVALID_STATE);
+        assert(find_entry(saved, "client_hist")->size == size);
+        assert(memcmp(find_entry(saved, "client_hist")->data, history_fixture, size) == 0);
+        assert(repeater_settings_factory_reset() == ESP_OK);
+        assert(repeater_settings_init() == ESP_OK);
+    }
+}
+
+static void test_history_failures(void)
+{
+    size_t size = make_history_fixture(false, 99, 2);
+    assert_unreadable_history_preserved(size); /* Future schema. */
+    size = make_history_fixture(false, 2, 2);
+    assert_unreadable_history_preserved(size - 1); /* Truncated record. */
+    assert_unreadable_history_preserved(1); /* Truncated header. */
+    assert_unreadable_history_preserved(0);
+    size = make_history_fixture(false, 2, 2);
+    history_fixture[1] = 65;
+    assert_unreadable_history_preserved(size);
+    size = make_history_fixture(false, 2, 2);
+    memset(history_fixture + 8 + 168 + 18, 'x', 49); /* Unterminated second description. */
+    assert_unreadable_history_preserved(size);
+    size = make_history_fixture(true, 1, 2);
+    memset(history_fixture + 8 + 88, 'x', 18); /* Invalid second legacy MAC. */
+    assert_unreadable_history_preserved(size);
+    size = make_history_fixture(false, 2, 2);
+    memcpy(history_fixture + 8 + 168, history_fixture + 8, 18); /* Duplicate MAC. */
+    assert_unreadable_history_preserved(size);
+    size = make_history_fixture(false, 2, 64);
+    assert_unreadable_history_preserved(size + 1); /* Oversized blob. */
+
+    size = make_history_fixture(true, 1, 2);
+    seed_history_fixture(size);
+    assert(repeater_settings_init() == ESP_OK);
+    fail_commit = true;
+    assert(repeater_settings_record_client_connection("AA:BB:CC:DD:EE:FF") == ESP_FAIL);
+    assert(memcmp(find_entry(saved, "client_hist")->data, history_fixture, size) == 0);
+    fail_commit = false;
+    assert(repeater_settings_init() == ESP_OK);
+    assert_history_loaded(true, 2);
+
+    fail_history_read = true;
+    assert(repeater_settings_init() == ESP_FAIL);
+    assert(repeater_settings_record_client_connection("AA:BB:CC:DD:EE:FF") == ESP_ERR_INVALID_STATE);
+    assert(memcmp(find_entry(saved, "client_hist")->data, history_fixture, size) == 0);
+    fail_history_read = false;
+    assert(repeater_settings_init() == ESP_OK);
+    assert_history_loaded(true, 2);
+}
+
+static void test_description_only_upgrade(void)
+{
+    unsigned char legacy[4 + 24 * 67] = {1, 1, 0, 0};
+    nvs_handle_t handle;
+    memcpy(legacy + 4, "AA:BB:CC:DD:EE:FF", 18);
+    memcpy(legacy + 4 + 18, "Old label", 10);
+    memset(saved, 0, sizeof(saved));
+    assert(nvs_open("repeater_cfg", NVS_READWRITE, &handle) == ESP_OK);
+    assert(nvs_set_blob(handle, "dev_descs", legacy, sizeof(legacy)) == ESP_OK);
+    assert(nvs_commit(handle) == ESP_OK);
+    nvs_close(handle);
+    assert(repeater_settings_init() == ESP_OK);
+    assert(strcmp(repeater_settings_get_device_description("AA:BB:CC:DD:EE:FF"), "Old label") == 0);
+    assert(repeater_settings_record_client_connection("00:11:22:33:44:55") == ESP_OK);
+    assert(repeater_settings_init() == ESP_OK);
+    assert(strcmp(repeater_settings_get_device_description("AA:BB:CC:DD:EE:FF"), "Old label") == 0);
+}
+
 int main(void)
 {
     assert(repeater_settings_init() == ESP_OK);
@@ -178,5 +347,13 @@ int main(void)
     assert_custom_settings();
 
     puts("PASS: startup window, cancellation, reset indication, NVS defaults/reload, history, repeat reset, write failure");
+    for (int count = 0; count <= 64; count += (count == 0 ? 2 : 62)) {
+        test_history_upgrade(true, 1, (uint8_t)count);
+        test_history_upgrade(false, 1, (uint8_t)count);
+        test_history_upgrade(false, 2, (uint8_t)count);
+    }
+    test_history_failures();
+    test_description_only_upgrade();
+    puts("PASS: history migration, first post-OTA write, reboot/reset, malformed/future blobs, read/write failures");
     return 0;
 }

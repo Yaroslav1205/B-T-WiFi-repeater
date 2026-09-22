@@ -12,6 +12,15 @@ ESP32-C3 Wi-Fi repeater project in `AP + STA` mode with:
 - status LED that shows uplink state and connected client count, with a saved on/off setting
 - OTA firmware updates from GitHub Releases
 
+## Version 1.0.8
+
+- Apply the saved light/dark theme to client-save confirmations, settings confirmations, and firmware update pages using the shared dashboard palette.
+- Migrate client history from pre-1.0.7 and 1.0.7 storage layouts without discarding saved records.
+- Protect unreadable or unsupported history from being overwritten, including after a settings factory reset.
+- Log when emergency NVS recovery clears settings and client history.
+
+History already overwritten by older firmware cannot be recovered. See the OTA history compatibility notes below.
+
 ## Project structure
 
 - `main/app_main.c`  
@@ -66,6 +75,28 @@ Reset indication works even when the saved status LED option is Off. After reset
 **hidden SSID is Off** (the network is visible) and **status LED is On**.
 The default network is **B-T WiFi repeater**, password **12345678**; the web login
 is **admin / admin**. Client history is preserved.
+
+## Client history across OTA updates
+
+OTA writes the inactive application partition; client history stays in NVS.
+The history reader supports the fixed 64-slot format used before 1.0.7 and
+the compact format written by 1.0.7. MAC addresses, descriptions and timestamps
+are retained; existing hostnames and IP addresses are retained when present.
+The next history write saves the migrated records using format version 2.
+
+Version 1.0.7 changed the record layout without migrating the previous format.
+It could display an empty history and replace the old blob on the next client
+connection. This fix can recover old records only if they have not already been
+overwritten.
+
+An unreadable or unsupported history blob now disables history writes and logs
+the error, preserving the original data. A settings factory reset also preserves
+this protection. If NVS initialization reports NO_FREE_PAGES or
+NEW_VERSION_FOUND, startup logs a warning, erases NVS and initializes it again
+so the device can boot with defaults. This emergency recovery resets all saved
+settings and client history; it is not triggered by an unsupported history
+record format. Other initialization errors, or a failed erase/retry, still stop
+normal startup. Do not downgrade to firmware with the old destructive reader.
 
 ## Main configuration points
 

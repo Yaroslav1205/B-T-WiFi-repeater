@@ -33,7 +33,7 @@
 #define THEME_TOKEN_MAX_LEN 16
 #define LEGACY_DEVICE_DESCRIPTION_MAX_ENTRIES 24
 #define DEVICE_DESCRIPTION_STORE_VERSION 1
-#define CLIENT_HISTORY_STORE_VERSION 1
+#define CLIENT_HISTORY_STORE_VERSION 2
 #define MIN_VALID_UNIX_TIMESTAMP 1704067200LL
 
 static const char *TAG = "RepeaterCfg";
@@ -45,12 +45,39 @@ typedef struct {
     repeater_device_description_t entries[LEGACY_DEVICE_DESCRIPTION_MAX_ENTRIES];
 } repeater_device_description_store_t;
 
+/*
+ * Frozen disk layouts: do not tie persisted data to the runtime/UI structure.
+ * Before 1.0.7, version 1 stored all 64 entries without hostname/IP. Version
+ * 1.0.7 also wrote version 1, but used the extended layout and a compact blob.
+ */
+typedef struct {
+    char mac[18];
+    char description[49];
+    uint8_t padding[5];
+    int64_t first_seen_epoch;
+    int64_t last_seen_epoch;
+} repeater_client_history_v1_entry_t;
+
+typedef struct {
+    char mac[18];
+    char description[49];
+    char hostname[64];
+    char last_local_ip[16];
+    uint8_t padding[5];
+    int64_t first_seen_epoch;
+    int64_t last_seen_epoch;
+} repeater_client_history_disk_entry_t;
+
 typedef struct {
     uint8_t version;
     uint8_t count;
     uint8_t reserved[6];
-    repeater_client_history_entry_t entries[REPEATER_CLIENT_HISTORY_MAX_ENTRIES];
+    repeater_client_history_disk_entry_t entries[REPEATER_CLIENT_HISTORY_MAX_ENTRIES];
 } repeater_client_history_store_t;
+
+_Static_assert(sizeof(repeater_client_history_v1_entry_t) == 88, "Legacy history layout changed");
+_Static_assert(sizeof(repeater_client_history_disk_entry_t) == 168, "History disk layout changed");
+_Static_assert(offsetof(repeater_client_history_store_t, entries) == 8, "History header changed");
 
 static size_t repeater_client_history_store_header_size(void)
 {
@@ -103,6 +130,8 @@ static repeater_softap_config_t s_softap_config;
 static repeater_web_auth_config_t s_web_auth_config;
 static repeater_client_history_entry_t s_client_history[REPEATER_CLIENT_HISTORY_MAX_ENTRIES];
 static size_t s_client_history_count = 0;
+/* Enable writes only after the saved history has been read successfully. */
+static bool s_client_history_writable = false;
 
 static int hex_char_to_int(char ch)
 {
@@ -381,31 +410,55 @@ static void set_runtime_defaults(bool preserve_client_history)
     }
 }
 
-static esp_err_t load_client_history_from_store(const repeater_client_history_store_t *store)
+static esp_err_t load_client_history_from_store(const void *blob, size_t blob_size)
 {
-    clear_client_history();
+    const uint8_t *bytes = blob;
+    const size_t header_size = repeater_client_history_store_header_size();
+    const size_t legacy_size = header_size + 64 * sizeof(repeater_client_history_v1_entry_t);
+    bool legacy_layout;
 
-    if (store->version != CLIENT_HISTORY_STORE_VERSION ||
-        store->count > REPEATER_CLIENT_HISTORY_MAX_ENTRIES) {
+    clear_client_history();
+    if (blob_size < header_size || bytes[1] > REPEATER_CLIENT_HISTORY_MAX_ENTRIES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t version = bytes[0];
+    const uint8_t count = bytes[1];
+    legacy_layout = version == 1 && blob_size == legacy_size;
+    if (!legacy_layout &&
+        ((version != 1 && version != CLIENT_HISTORY_STORE_VERSION) ||
+         blob_size != repeater_client_history_store_size_for_count(count))) {
         return ESP_ERR_INVALID_VERSION;
     }
 
-    for (size_t i = 0; i < store->count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
+        repeater_client_history_disk_entry_t saved = {0};
         char normalized_mac[REPEATER_MAC_STRING_LEN];
-        char trimmed_description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
-        char trimmed_hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
-        char trimmed_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
         repeater_client_history_entry_t *entry;
-        int64_t first_seen = store->entries[i].first_seen_epoch;
-        int64_t last_seen = store->entries[i].last_seen_epoch;
 
-        if (!normalize_mac_address(store->entries[i].mac, normalized_mac, sizeof(normalized_mac))) {
+        if (legacy_layout) {
+            repeater_client_history_v1_entry_t old;
+            memcpy(&old, bytes + header_size + i * sizeof(old), sizeof(old));
+            memcpy(saved.mac, old.mac, sizeof(saved.mac));
+            memcpy(saved.description, old.description, sizeof(saved.description));
+            saved.first_seen_epoch = old.first_seen_epoch;
+            saved.last_seen_epoch = old.last_seen_epoch;
+        } else {
+            memcpy(&saved, bytes + header_size + i * sizeof(saved), sizeof(saved));
+        }
+
+        /* Check termination before passing flash data to string functions. */
+        if (memchr(saved.mac, '\0', sizeof(saved.mac)) == NULL ||
+            memchr(saved.description, '\0', sizeof(saved.description)) == NULL ||
+            memchr(saved.hostname, '\0', sizeof(saved.hostname)) == NULL ||
+            memchr(saved.last_local_ip, '\0', sizeof(saved.last_local_ip)) == NULL ||
+            !normalize_mac_address(saved.mac, normalized_mac, sizeof(normalized_mac)) ||
+            find_client_history_index(normalized_mac) >= 0) {
             return ESP_ERR_INVALID_ARG;
         }
 
-        trim_text_copy(store->entries[i].description, trimmed_description, sizeof(trimmed_description));
-        trim_text_copy(store->entries[i].hostname, trimmed_hostname, sizeof(trimmed_hostname));
-        trim_text_copy(store->entries[i].last_local_ip, trimmed_local_ip, sizeof(trimmed_local_ip));
+        int64_t first_seen = saved.first_seen_epoch;
+        int64_t last_seen = saved.last_seen_epoch;
         if (first_seen < MIN_VALID_UNIX_TIMESTAMP) {
             first_seen = 0;
         }
@@ -423,10 +476,9 @@ static esp_err_t load_client_history_from_store(const repeater_client_history_st
         if (entry == NULL) {
             return ESP_ERR_NO_MEM;
         }
-
-        snprintf(entry->description, sizeof(entry->description), "%s", trimmed_description);
-        snprintf(entry->hostname, sizeof(entry->hostname), "%s", trimmed_hostname);
-        snprintf(entry->last_local_ip, sizeof(entry->last_local_ip), "%s", trimmed_local_ip);
+        trim_text_copy(saved.description, entry->description, sizeof(entry->description));
+        trim_text_copy(saved.hostname, entry->hostname, sizeof(entry->hostname));
+        trim_text_copy(saved.last_local_ip, entry->last_local_ip, sizeof(entry->last_local_ip));
         entry->first_seen_epoch = first_seen;
         entry->last_seen_epoch = last_seen;
     }
@@ -448,7 +500,9 @@ static esp_err_t load_legacy_device_descriptions_from_store(const repeater_devic
         char trimmed_description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
         repeater_client_history_entry_t *entry;
 
-        if (!normalize_mac_address(store->entries[i].mac, normalized_mac, sizeof(normalized_mac))) {
+        if (memchr(store->entries[i].mac, '\0', sizeof(store->entries[i].mac)) == NULL ||
+            memchr(store->entries[i].description, '\0', sizeof(store->entries[i].description)) == NULL ||
+            !normalize_mac_address(store->entries[i].mac, normalized_mac, sizeof(normalized_mac))) {
             return ESP_ERR_INVALID_ARG;
         }
 
@@ -525,6 +579,8 @@ static bool is_valid_client_local_ip(const char *local_ip)
 
 static esp_err_t save_client_history_to_nvs(nvs_handle_t nvs_handle)
 {
+    ESP_RETURN_ON_FALSE(s_client_history_writable, ESP_ERR_INVALID_STATE, TAG,
+                        "Saved client history is unreadable; refusing to overwrite it");
     const size_t store_size = repeater_client_history_store_size_for_count(s_client_history_count);
     repeater_client_history_store_t *store = calloc(1, store_size);
     esp_err_t err;
@@ -536,7 +592,14 @@ static esp_err_t save_client_history_to_nvs(nvs_handle_t nvs_handle)
     store->count = (uint8_t)s_client_history_count;
 
     for (size_t i = 0; i < s_client_history_count; ++i) {
-        store->entries[i] = s_client_history[i];
+        repeater_client_history_disk_entry_t *saved = &store->entries[i];
+        const repeater_client_history_entry_t *entry = &s_client_history[i];
+        copy_text(entry->mac, saved->mac, sizeof(saved->mac));
+        copy_text(entry->description, saved->description, sizeof(saved->description));
+        copy_text(entry->hostname, saved->hostname, sizeof(saved->hostname));
+        copy_text(entry->last_local_ip, saved->last_local_ip, sizeof(saved->last_local_ip));
+        saved->first_seen_epoch = entry->first_seen_epoch;
+        saved->last_seen_epoch = entry->last_seen_epoch;
     }
 
     err = nvs_set_blob(nvs_handle, NVS_KEY_CLIENT_HISTORY, store, store_size);
@@ -667,6 +730,7 @@ static esp_err_t erase_key_if_present(nvs_handle_t nvs_handle, const char *key)
 
 esp_err_t repeater_settings_init(void)
 {
+    s_client_history_writable = false;
     nvs_handle_t nvs_handle;
     int8_t stored_value = PROJECT_DEFAULT_TX_POWER_QUARTER_DBM;
     size_t theme_token_len = sizeof(s_theme_token);
@@ -678,6 +742,7 @@ esp_err_t repeater_settings_init(void)
 
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         set_runtime_defaults(false);
+        s_client_history_writable = true;
         ESP_LOGI(TAG, "No saved signal level in NVS, using default: %s",
                  repeater_settings_get_signal_level_label());
         ESP_LOGI(TAG, "No saved theme in NVS, using default: %s",
@@ -975,13 +1040,15 @@ esp_err_t repeater_settings_init(void)
                                &legacy_device_store_size);
             if (err == ESP_ERR_NVS_NOT_FOUND) {
                 clear_client_history();
+                s_client_history_writable = true;
                 ESP_LOGI(TAG, "Client history key not found in NVS");
             } else if (err == ESP_OK) {
                 if (legacy_device_store_size != sizeof(*legacy_device_store) ||
                     load_legacy_device_descriptions_from_store(legacy_device_store) != ESP_OK) {
                     clear_client_history();
-                    ESP_LOGW(TAG, "Invalid legacy device descriptions, ignoring stored data");
+                    ESP_LOGE(TAG, "Invalid legacy device descriptions; history writes disabled");
                 } else {
+                    s_client_history_writable = true;
                     ESP_LOGI(TAG, "Loaded %u legacy device descriptions into client history",
                              (unsigned int)s_client_history_count);
                 }
@@ -997,7 +1064,7 @@ esp_err_t repeater_settings_init(void)
 
             if (client_history_store_size < min_store_size || client_history_store_size > max_store_size) {
                 clear_client_history();
-                ESP_LOGW(TAG, "Saved client history has invalid size %u, ignoring stored data",
+                ESP_LOGE(TAG, "Saved client history has invalid size %u; history writes disabled",
                          (unsigned int)client_history_store_size);
             } else {
                 client_history_store = calloc(1, client_history_store_size);
@@ -1017,20 +1084,19 @@ esp_err_t repeater_settings_init(void)
                     ESP_RETURN_ON_ERROR(err, TAG, "Failed to read client history from NVS");
                 }
 
-                if (client_history_store->count > REPEATER_CLIENT_HISTORY_MAX_ENTRIES ||
-                    client_history_store_size !=
-                        repeater_client_history_store_size_for_count(client_history_store->count) ||
-                    load_client_history_from_store(client_history_store) != ESP_OK) {
+                if (load_client_history_from_store(client_history_store,
+                                                   client_history_store_size) != ESP_OK) {
                     clear_client_history();
-                    ESP_LOGW(TAG, "Invalid saved client history, ignoring stored data");
+                    ESP_LOGE(TAG, "Invalid or unsupported client history; history writes disabled");
                 } else {
+                    s_client_history_writable = true;
                     ESP_LOGI(TAG, "Loaded %u saved client history records from NVS",
                              (unsigned int)s_client_history_count);
                 }
             }
         } else if (err == ESP_ERR_NVS_INVALID_LENGTH) {
             clear_client_history();
-            ESP_LOGW(TAG, "Saved client history uses an older layout, ignoring stored data");
+            ESP_LOGE(TAG, "Cannot read saved client history; history writes disabled");
         } else {
             free(legacy_device_store);
             nvs_close(nvs_handle);
@@ -1238,6 +1304,8 @@ esp_err_t repeater_settings_set_failsafe_reboot_timeout_minutes(uint8_t timeout_
 
 esp_err_t repeater_settings_record_client_connection(const char *mac)
 {
+    ESP_RETURN_ON_FALSE(s_client_history_writable, ESP_ERR_INVALID_STATE, TAG,
+                        "Saved client history is unreadable; refusing to overwrite it");
     nvs_handle_t nvs_handle;
     char normalized_mac[REPEATER_MAC_STRING_LEN];
     repeater_client_history_entry_t *entry;
@@ -1274,6 +1342,8 @@ esp_err_t repeater_settings_record_client_connection(const char *mac)
 
 esp_err_t repeater_settings_set_client_hostname(const char *mac, const char *hostname)
 {
+    ESP_RETURN_ON_FALSE(s_client_history_writable, ESP_ERR_INVALID_STATE, TAG,
+                        "Saved client history is unreadable; refusing to overwrite it");
     nvs_handle_t nvs_handle;
     char normalized_mac[REPEATER_MAC_STRING_LEN];
     char trimmed_hostname[REPEATER_CLIENT_HOSTNAME_MAX_LEN + 1];
@@ -1311,6 +1381,8 @@ esp_err_t repeater_settings_set_client_hostname(const char *mac, const char *hos
 
 esp_err_t repeater_settings_set_client_last_local_ip(const char *mac, const char *local_ip)
 {
+    ESP_RETURN_ON_FALSE(s_client_history_writable, ESP_ERR_INVALID_STATE, TAG,
+                        "Saved client history is unreadable; refusing to overwrite it");
     nvs_handle_t nvs_handle;
     char normalized_mac[REPEATER_MAC_STRING_LEN];
     char trimmed_local_ip[REPEATER_CLIENT_LOCAL_IP_MAX_LEN + 1];
@@ -1348,6 +1420,8 @@ esp_err_t repeater_settings_set_client_last_local_ip(const char *mac, const char
 
 esp_err_t repeater_settings_set_device_description(const char *mac, const char *description)
 {
+    ESP_RETURN_ON_FALSE(s_client_history_writable, ESP_ERR_INVALID_STATE, TAG,
+                        "Saved client history is unreadable; refusing to overwrite it");
     nvs_handle_t nvs_handle;
     char normalized_mac[REPEATER_MAC_STRING_LEN];
     char trimmed_description[REPEATER_DEVICE_DESCRIPTION_MAX_LEN + 1];
